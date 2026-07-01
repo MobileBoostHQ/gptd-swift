@@ -94,6 +94,15 @@ public enum CachingMode: String {
     case fullScreen = "FULL_SCREEN"
 }
 
+/// How the SDK enters text into fields (native XCUITest mode only).
+public enum TextEntryMode {
+    /// Default. Types characters via `XCUIApplication.typeText`.
+    case type
+    /// Sets `UIPasteboard.general` and pastes into the focused field via the
+    /// UIKit edit menu. Use when `typeText` drops characters on the simulator.
+    case paste
+}
+
 enum GPTLogLevel {
     case debug
     case info
@@ -180,11 +189,13 @@ class NativeActionExecutor {
     let app: XCUIApplication
     private let logger: Logger
     private let sessionIdProvider: () -> String?
-    
-    init(app: XCUIApplication, logger: Logger, sessionIdProvider: @escaping () -> String?) {
+    private let textEntryMode: TextEntryMode
+
+    init(app: XCUIApplication, logger: Logger, sessionIdProvider: @escaping () -> String?, textEntryMode: TextEntryMode = .type) {
         self.app = app
         self.logger = logger
         self.sessionIdProvider = sessionIdProvider
+        self.textEntryMode = textEntryMode
     }
     
     private func log(_ level: GPTLogLevel, _ message: String, metadata: [String: Any] = [:]) {
@@ -394,13 +405,55 @@ class NativeActionExecutor {
                         text.append(char)
                     }
                 }
-                log(.info, "Typing text", metadata: ["text": text, "cacheHit": cacheHit])
-                XCTContext.runActivity(named: "GPTDriver Typing Text: \(text)\(cacheLabel)") { _ in }
-                self.app.typeText(text)
+                // Special W3C key codes (Enter, Backspace, etc.) live in the Unicode
+                // private-use area (E000–F8FF) and can't be pasted literally — type those.
+                let hasSpecialKeys = text.unicodeScalars.contains { (0xE000...0xF8FF).contains($0.value) }
+                if self.textEntryMode == .paste && !text.isEmpty && !hasSpecialKeys {
+                    self.pasteText(text, cacheLabel: cacheLabel, cacheHit: cacheHit)
+                } else {
+                    log(.info, "Typing text", metadata: ["text": text, "cacheHit": cacheHit])
+                    XCTContext.runActivity(named: "GPTDriver Typing Text: \(text)\(cacheLabel)") { _ in }
+                    self.app.typeText(text)
+                }
             }
         }
     }
-    
+
+    /// Sets the system pasteboard to `text` and pastes it into the currently
+    /// focused field via the UIKit edit menu. Used when `textEntryMode == .paste`
+    /// to avoid `typeText` dropping characters on the simulator. Element-independent:
+    /// it locates the focused field via `hasKeyboardFocus`. Falls back to `typeText`
+    /// if no focused field or Paste menu item is found. Must run on the main actor.
+    private func pasteText(_ text: String, cacheLabel: String, cacheHit: Bool) {
+        UIPasteboard.general.string = text
+        log(.info, "Pasting text via clipboard", metadata: ["length": text.count, "cacheHit": cacheHit])
+        XCTContext.runActivity(named: "GPTDriver Paste Text (clipboard)\(cacheLabel)") { _ in }
+
+        // Find the currently focused field generically (no element handle needed).
+        let focused = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "hasKeyboardFocus == true"))
+            .firstMatch
+
+        guard focused.waitForExistence(timeout: 3) else {
+            log(.warning, "No focused field for paste; falling back to typeText")
+            app.typeText(text)
+            return
+        }
+
+        // Surface the edit menu and tap Paste (locale-tolerant labels).
+        focused.press(forDuration: 0.8)
+        let pasteLabels = ["Paste"]   // extend for non-English locales if needed
+        for label in pasteLabels {
+            let item = app.menuItems[label]
+            if item.waitForExistence(timeout: 2) {
+                item.tap()
+                return
+            }
+        }
+        log(.warning, "Paste menu item not found; falling back to typeText")
+        app.typeText(text)   // safety net
+    }
+
     private func executePauseActions(_ actions: [WebDriverAction], cacheHit: Bool) async {
         let cacheLabel = cacheHit ? " [cached]" : ""
         for action in actions {
@@ -492,6 +545,7 @@ public class GptDriver {
     private let cachingMode: CachingMode
     private let testId: String
     private let additionalUserContext: String
+    private let textEntryMode: TextEntryMode
     private var stepCounter: Int = 1
     
     /// Optional callback that is invoked when a new session is created.
@@ -541,7 +595,8 @@ public class GptDriver {
                   nativeApp: XCUIApplication? = nil,
                   cachingMode: CachingMode = .none,
                   testId: String = "",
-                  additionalUserContext: String = "") {
+                  additionalUserContext: String = "",
+                  textEntryMode: TextEntryMode = .type) {
         self.apiKey = apiKey
         self.appiumServerUrl = appiumServerUrl
         self.deviceName = deviceName
@@ -551,6 +606,7 @@ public class GptDriver {
         self.cachingMode = cachingMode
         self.testId = testId
         self.additionalUserContext = additionalUserContext
+        self.textEntryMode = textEntryMode
         
         if appiumServerUrl == nil {
             self.nativeApp = nativeApp ?? XCUIApplication()
@@ -566,12 +622,14 @@ public class GptDriver {
     ///   - cachingMode: The caching mode to use for interactions. Defaults to `.none`
     ///   - testId: Optional test identifier used for cache matching. Defaults to empty string.
     ///   - additionalUserContext: Optional free-form context string sent to the backend alongside the session. Defaults to empty string.
+    ///   - textEntryMode: How text is entered into fields. `.type` (default) uses `typeText`; `.paste` sets the clipboard and pastes into the focused field, avoiding `typeText` character drops on the simulator.
     public convenience init(apiKey: String,
                             nativeApp: XCUIApplication = XCUIApplication(),
                             cachingMode: CachingMode = .none,
                             testId: String = "",
-                            additionalUserContext: String = "") {
-        self.init(apiKey: apiKey, appiumServerUrl: nil, deviceName: nil, platform: nil, platformVersion: nil, nativeApp: nativeApp, cachingMode: cachingMode, testId: testId, additionalUserContext: additionalUserContext)
+                            additionalUserContext: String = "",
+                            textEntryMode: TextEntryMode = .type) {
+        self.init(apiKey: apiKey, appiumServerUrl: nil, deviceName: nil, platform: nil, platformVersion: nil, nativeApp: nativeApp, cachingMode: cachingMode, testId: testId, additionalUserContext: additionalUserContext, textEntryMode: textEntryMode)
     }
     
     /// Initializes GptDriver for execution via a remote Appium server.
@@ -1058,7 +1116,8 @@ public class GptDriver {
                                                     logger: structuredLogger,
                                                     sessionIdProvider: { [weak self] in
                                                         self?.gptDriverSessionId
-                                                    })
+                                                    },
+                                                    textEntryMode: textEntryMode)
                 if let data = command.data {
                     await executor.executeCommand(with: data, cacheHit: cacheHit)
                 } else {
