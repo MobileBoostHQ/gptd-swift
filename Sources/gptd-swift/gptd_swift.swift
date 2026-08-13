@@ -180,11 +180,16 @@ class NativeActionExecutor {
     let app: XCUIApplication
     private let logger: Logger
     private let sessionIdProvider: () -> String?
-    
-    init(app: XCUIApplication, logger: Logger, sessionIdProvider: @escaping () -> String?) {
+    private let charactersPerSecond: Int?
+
+    init(app: XCUIApplication,
+         logger: Logger,
+         sessionIdProvider: @escaping () -> String?,
+         charactersPerSecond: Int?) {
         self.app = app
         self.logger = logger
         self.sessionIdProvider = sessionIdProvider
+        self.charactersPerSecond = charactersPerSecond
     }
     
     private func log(_ level: GPTLogLevel, _ message: String, metadata: [String: Any] = [:]) {
@@ -377,26 +382,107 @@ class NativeActionExecutor {
         }
     }
     
+    /// Translates W3C WebDriver key codepoints into what `typeText` understands.
+    ///
+    /// WebDriver encodes special keys as Unicode Private Use Area codepoints. Typing one of those
+    /// literally does not press the key, and on iOS it is actively harmful: that range overlaps
+    /// Apple's legacy SoftBank emoji table, so a backspace (U+E003) renders as a kiss-mark emoji
+    /// instead of deleting a character. Any WebDriver key we cannot translate is dropped rather
+    /// than typed, so an unhandled key inserts nothing instead of a stray glyph.
+    ///
+    /// - Returns: the string to type, and a human-readable form of it for logs and test activities,
+    ///   since the typed string is mostly invisible control characters.
+    private func translateWebDriverKeys(_ raw: String) -> (text: String, description: String) {
+        // U+E000...U+E05D covers the key codepoints reserved by the WebDriver specification.
+        let webDriverKeyCodepoints: ClosedRange<UInt32> = 0xE000...0xE05D
+
+        var text = ""
+        var description = ""
+
+        for character in raw {
+            switch character {
+            case "\u{E003}":
+                text.append(XCUIKeyboardKey.delete.rawValue)
+                description.append("⌫")
+            case "\u{E006}", "\u{E007}":
+                text.append("\n")
+                description.append("⏎")
+            default:
+                if character.unicodeScalars.count == 1,
+                   let scalar = character.unicodeScalars.first,
+                   webDriverKeyCodepoints.contains(scalar.value) {
+                    log(.warning, "Dropping unsupported WebDriver key", metadata: [
+                        "codepoint": String(format: "U+%04X", scalar.value)
+                    ])
+                    continue
+                }
+                text.append(character)
+                description.append(character)
+            }
+        }
+
+        return (text, description)
+    }
+
     private func executeKeyActions(_ actions: [WebDriverAction], cacheHit: Bool) async {
         let cacheLabel = cacheHit ? " [cached]" : ""
-        await MainActor.run {
-            if let first = actions.first,
-               first.type == "keyDown",
-               let value = first.value,
-               value == "\u{e011}" {
+
+        if let first = actions.first,
+           first.type == "keyDown",
+           let value = first.value,
+           value == "\u{e011}" {
+            await MainActor.run {
                 log(.info, "Invoking home button", metadata: ["cacheHit": cacheHit])
                 XCTContext.runActivity(named: "GPTDriver Press Home Button\(cacheLabel)") { _ in }
                 XCUIDevice.shared.press(.home)
-            } else {
-                var text = ""
-                for action in actions {
-                    if action.type == "keyDown", let char = action.value {
-                        text.append(char)
-                    }
-                }
-                log(.info, "Typing text", metadata: ["text": text, "cacheHit": cacheHit])
-                XCTContext.runActivity(named: "GPTDriver Typing Text: \(text)\(cacheLabel)") { _ in }
+            }
+            return
+        }
+
+        var collectedText = ""
+        for action in actions {
+            if action.type == "keyDown", let char = action.value {
+                collectedText.append(char)
+            }
+        }
+        let (text, textDescription) = translateWebDriverKeys(collectedText)
+
+        guard !text.isEmpty else {
+            log(.warning, "Key actions contained no typeable keys", metadata: ["cacheHit": cacheHit])
+            return
+        }
+
+        guard let charactersPerSecond = charactersPerSecond, charactersPerSecond > 0 else {
+            await MainActor.run {
+                log(.info, "Typing text", metadata: ["text": textDescription, "cacheHit": cacheHit])
+                XCTContext.runActivity(named: "GPTDriver Typing Text: \(textDescription)\(cacheLabel)") { _ in }
                 self.app.typeText(text)
+            }
+            return
+        }
+
+        let delayNanoseconds = UInt64(1_000_000_000 / charactersPerSecond)
+        await MainActor.run {
+            log(.info, "Typing text", metadata: [
+                "text": textDescription,
+                "cacheHit": cacheHit,
+                "charactersPerSecond": charactersPerSecond,
+                "characterCount": text.count
+            ])
+            XCTContext.runActivity(named: "GPTDriver Typing Text: \(textDescription)\(cacheLabel)") { _ in }
+        }
+
+        let lastIndex = text.count - 1
+        for (index, character) in text.enumerated() {
+            await MainActor.run {
+                self.app.typeText(String(character))
+            }
+            if index < lastIndex {
+                do {
+                    try await Task.sleep(nanoseconds: delayNanoseconds)
+                } catch {
+                    log(.warning, "Typing delay interrupted", metadata: ["error": error.localizedDescription])
+                }
             }
         }
     }
@@ -492,6 +578,8 @@ public class GptDriver {
     private let cachingMode: CachingMode
     private let testId: String
     private let additionalUserContext: String
+    private let logNativeExecutions: Bool
+    private let charactersPerSecond: Int?
     private var stepCounter: Int = 1
     
     /// Optional callback that is invoked when a new session is created.
@@ -541,7 +629,9 @@ public class GptDriver {
                   nativeApp: XCUIApplication? = nil,
                   cachingMode: CachingMode = .none,
                   testId: String = "",
-                  additionalUserContext: String = "") {
+                  additionalUserContext: String = "",
+                  logNativeExecutions: Bool = true,
+                  charactersPerSecond: Int? = 10) {
         self.apiKey = apiKey
         self.appiumServerUrl = appiumServerUrl
         self.deviceName = deviceName
@@ -551,7 +641,9 @@ public class GptDriver {
         self.cachingMode = cachingMode
         self.testId = testId
         self.additionalUserContext = additionalUserContext
-        
+        self.logNativeExecutions = logNativeExecutions
+        self.charactersPerSecond = charactersPerSecond
+
         if appiumServerUrl == nil {
             self.nativeApp = nativeApp ?? XCUIApplication()
         } else {
@@ -566,12 +658,21 @@ public class GptDriver {
     ///   - cachingMode: The caching mode to use for interactions. Defaults to `.none`
     ///   - testId: Optional test identifier used for cache matching. Defaults to empty string.
     ///   - additionalUserContext: Optional free-form context string sent to the backend alongside the session. Defaults to empty string.
+    ///   - logNativeExecutions: When `true`, successful `nativeAction` blocks are reported to the backend so they
+    ///     appear as steps in the session recording. Each report captures and uploads a screenshot, so set this to
+    ///     `false` to trade session visibility for speed in tests with many native steps. Defaults to `true`.
+    ///   - charactersPerSecond: How fast to type text on the device. Defaults to `10`, which types one character at
+    ///     a time and pauses `1 / charactersPerSecond` seconds in between, so apps that do per-keystroke work have
+    ///     time to keep up. Lower it if characters still go missing on slow or heavily loaded devices. Pass `nil` to
+    ///     type each string in a single `typeText` call instead, which is faster but can drop characters.
     public convenience init(apiKey: String,
                             nativeApp: XCUIApplication = XCUIApplication(),
                             cachingMode: CachingMode = .none,
                             testId: String = "",
-                            additionalUserContext: String = "") {
-        self.init(apiKey: apiKey, appiumServerUrl: nil, deviceName: nil, platform: nil, platformVersion: nil, nativeApp: nativeApp, cachingMode: cachingMode, testId: testId, additionalUserContext: additionalUserContext)
+                            additionalUserContext: String = "",
+                            logNativeExecutions: Bool = true,
+                            charactersPerSecond: Int? = 10) {
+        self.init(apiKey: apiKey, appiumServerUrl: nil, deviceName: nil, platform: nil, platformVersion: nil, nativeApp: nativeApp, cachingMode: cachingMode, testId: testId, additionalUserContext: additionalUserContext, logNativeExecutions: logNativeExecutions, charactersPerSecond: charactersPerSecond)
     }
     
     /// Initializes GptDriver for execution via a remote Appium server.
@@ -584,6 +685,13 @@ public class GptDriver {
     ///   - cachingMode: The caching mode to use for interactions. Defaults to `.none`
     ///   - testId: Optional test identifier used for cache matching. Defaults to empty string.
     ///   - additionalUserContext: Optional free-form context string sent to the backend alongside the session. Defaults to empty string.
+    ///   - logNativeExecutions: When `true`, successful `nativeAction` blocks are reported to the backend so they
+    ///     appear as steps in the session recording. Each report captures and uploads a screenshot, so set this to
+    ///     `false` to trade session visibility for speed in tests with many native steps. Defaults to `true`.
+    ///   - charactersPerSecond: How fast to type text on the device. Defaults to `10`, which types one character at
+    ///     a time and pauses `1 / charactersPerSecond` seconds in between, so apps that do per-keystroke work have
+    ///     time to keep up. Lower it if characters still go missing on slow or heavily loaded devices. Pass `nil` to
+    ///     type each string in a single `typeText` call instead, which is faster but can drop characters.
     public convenience init(apiKey: String,
                             appiumServerUrl: URL,
                             deviceName: String,
@@ -591,8 +699,10 @@ public class GptDriver {
                             platformVersion: String,
                             cachingMode: CachingMode = .none,
                             testId: String = "",
-                            additionalUserContext: String = "") {
-        self.init(apiKey: apiKey, appiumServerUrl: appiumServerUrl, deviceName: deviceName, platform: platform, platformVersion: platformVersion, nativeApp: nil, cachingMode: cachingMode, testId: testId, additionalUserContext: additionalUserContext)
+                            additionalUserContext: String = "",
+                            logNativeExecutions: Bool = true,
+                            charactersPerSecond: Int? = 10) {
+        self.init(apiKey: apiKey, appiumServerUrl: appiumServerUrl, deviceName: deviceName, platform: platform, platformVersion: platformVersion, nativeApp: nil, cachingMode: cachingMode, testId: testId, additionalUserContext: additionalUserContext, logNativeExecutions: logNativeExecutions, charactersPerSecond: charactersPerSecond)
     }
     
     deinit {
@@ -764,7 +874,82 @@ public class GptDriver {
         return nativeError
     }
 
+    // MARK: - Native Step Reporting
+
+    private func jsonArrayString(_ values: [String]) -> String {
+        guard let data = try? JSONSerialization.data(withJSONObject: values, options: []),
+              let jsonString = String(data: data, encoding: .utf8) else {
+            return "\(values)"
+        }
+        return jsonString
+    }
+
+    private func assertionCommandLabel(_ assertions: [String]) -> String {
+        return "Assert: \(jsonArrayString(assertions))"
+    }
+
+    private func captureScreenshotForNativeStep(timeout: TimeInterval = 60) -> String? {
+        guard logNativeExecutions else { return nil }
+        do {
+            return try performSync(timeout: timeout) {
+                try await self.takeScreenshotBase64()
+            }
+        } catch {
+            log(.warning, "Failed to capture screenshot for native step", metadata: [
+                "error": error.localizedDescription
+            ])
+            return nil
+        }
+    }
+
+    private func logNativeStep(command: String, screenshotBase64: String?, timeout: TimeInterval = 30) {
+        guard logNativeExecutions, gptDriverSessionId != nil else { return }
+        do {
+            try performSync(timeout: timeout) {
+                try await self._logCodeExecutionAsync(command: command, screenshotBase64: screenshotBase64)
+            }
+        } catch {
+            log(.warning, "Failed to report native step", metadata: [
+                "command": command,
+                "error": error.localizedDescription
+            ])
+        }
+    }
+
+    private func _logCodeExecutionAsync(command: String, screenshotBase64: String?) async throws {
+        guard let gptDriverSessionId = gptDriverSessionId else { return }
+
+        let currentStep = stepCounter
+        stepCounter += 1
+
+        let requestUrl = gptDriverBaseUrl
+            .appendingPathComponent("sessions")
+            .appendingPathComponent(gptDriverSessionId)
+            .appendingPathComponent("log_code_execution")
+
+        var requestBody: [String: Any] = [
+            "api_key": apiKey,
+            "command": command,
+            "step_counter": currentStep,
+            "caching_mode": cachingMode.rawValue
+        ]
+        if let screenshotBase64 = screenshotBase64 {
+            requestBody["base64_screenshot"] = screenshotBase64
+        }
+
+        _ = try await postJson(to: requestUrl, jsonObject: requestBody)
+
+        log(.info, "Native step reported", metadata: [
+            "command": command,
+            "stepNumber": currentStep,
+            "hasScreenshot": screenshotBase64 != nil
+        ])
+    }
+
     /// Executes a command, trying native XCUITest code first and falling back to AI execution on failure.
+    ///
+    /// On success the native block is reported to the backend so it appears in the session recording;
+    /// on failure the AI fallback records the step itself.
     ///
     /// - Parameters:
     ///   - command: The natural-language command used as AI fallback
@@ -778,6 +963,7 @@ public class GptDriver {
         try ensureSession(timeout: timeout)
 
         log(.info, "Native execute attempt", metadata: ["command": command])
+        let screenshotBase64 = captureScreenshotForNativeStep()
         let nativeError = runNativeAction("GPTDriver Native Execute: \(command)", nativeAction)
 
         if let error = nativeError {
@@ -792,6 +978,7 @@ public class GptDriver {
         } else {
             log(.info, "Native execute succeeded", metadata: ["command": command])
             XCTContext.runActivity(named: "GPTDriver Native Execute Succeeded: \(command)") { _ in }
+            logNativeStep(command: command, screenshotBase64: screenshotBase64)
         }
     }
 
@@ -811,6 +998,7 @@ public class GptDriver {
         try ensureSession(timeout: timeout)
 
         log(.info, "Native assert attempt", metadata: ["assertion": assertion])
+        let screenshotBase64 = captureScreenshotForNativeStep()
         let nativeError = runNativeAction("GPTDriver Native Assert: \(assertion)", nativeAction)
 
         if let error = nativeError {
@@ -825,6 +1013,7 @@ public class GptDriver {
         } else {
             log(.info, "Native assert succeeded", metadata: ["assertion": assertion])
             XCTContext.runActivity(named: "GPTDriver Native Assert Succeeded: \(assertion)") { _ in }
+            logNativeStep(command: assertionCommandLabel([assertion]), screenshotBase64: screenshotBase64)
         }
     }
 
@@ -844,6 +1033,7 @@ public class GptDriver {
         try ensureSession(timeout: timeout)
 
         log(.info, "Native assertBulk attempt", metadata: ["count": assertions.count])
+        let screenshotBase64 = captureScreenshotForNativeStep()
         let nativeError = runNativeAction(
             "GPTDriver Native AssertBulk (\(assertions.count) conditions)", nativeAction)
 
@@ -859,6 +1049,7 @@ public class GptDriver {
         } else {
             log(.info, "Native assertBulk succeeded", metadata: ["count": assertions.count])
             XCTContext.runActivity(named: "GPTDriver Native AssertBulk Succeeded (\(assertions.count) conditions)") { _ in }
+            logNativeStep(command: assertionCommandLabel(assertions), screenshotBase64: screenshotBase64)
         }
     }
 
@@ -880,6 +1071,7 @@ public class GptDriver {
         try ensureSession(timeout: timeout)
 
         log(.info, "Native checkBulk attempt", metadata: ["count": conditions.count])
+        let screenshotBase64 = captureScreenshotForNativeStep()
         let nativeError = runNativeAction(
             "GPTDriver Native CheckBulk (\(conditions.count) conditions)", nativeAction)
 
@@ -895,6 +1087,7 @@ public class GptDriver {
         } else {
             log(.info, "Native checkBulk succeeded", metadata: ["count": conditions.count])
             XCTContext.runActivity(named: "GPTDriver Native CheckBulk Succeeded (\(conditions.count) conditions)") { _ in }
+            logNativeStep(command: assertionCommandLabel(conditions), screenshotBase64: screenshotBase64)
             return Dictionary(uniqueKeysWithValues: conditions.map { ($0, true) })
         }
     }
@@ -1058,7 +1251,8 @@ public class GptDriver {
                                                     logger: structuredLogger,
                                                     sessionIdProvider: { [weak self] in
                                                         self?.gptDriverSessionId
-                                                    })
+                                                    },
+                                                    charactersPerSecond: charactersPerSecond)
                 if let data = command.data {
                     await executor.executeCommand(with: data, cacheHit: cacheHit)
                 } else {
