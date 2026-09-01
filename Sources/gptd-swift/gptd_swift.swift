@@ -85,6 +85,66 @@ enum GPTDriverError: Error {
     case invalidResponse
     case missingSessionId
     case creationFailed(String)
+    /// The backend refused for billing reasons - a free-plan cap, or the
+    /// contractual hard limit on the organisation's booked AI volume. The
+    /// associated value is the message the backend wrote for the person
+    /// reading the test log.
+    case usageLimitReached(String)
+}
+
+extension GPTDriverError {
+    /// HTTP 402 Payment Required is the backend saying "this is about billing,
+    /// not about your test". Retrying never helps.
+    static let paymentRequiredStatusCode = 402
+
+    /// The readable message inside a 402 body.
+    ///
+    /// The backend answers with `{"detail": {"error_code": ..., "message": ...}}`;
+    /// older endpoints answer with a plain string detail, so both are accepted
+    /// and an unexpected body still yields something printable.
+    static func billingMessage(from data: Data) -> String {
+        let fallback = String(data: data, encoding: .utf8) ?? "Payment required"
+        guard
+            let parsed = try? JSONSerialization.jsonObject(with: data),
+            let json = parsed as? [String: Any]
+        else {
+            return fallback
+        }
+        if let detail = json["detail"] as? [String: Any] {
+            let message = (detail["message"] as? String) ?? ""
+            if let code = detail["error_code"] as? String {
+                return message.isEmpty ? "[\(code)]" : "[\(code)] \(message)"
+            }
+            return message.isEmpty ? fallback : message
+        }
+        if let detail = json["detail"] as? String, !detail.isEmpty {
+            return detail
+        }
+        return fallback
+    }
+}
+
+// Both are implemented: XCTest reports a thrown error through
+// `localizedDescription` in some paths and through `String(describing:)` in
+// others, and a customer blocked on billing should read the same sentence
+// either way.
+extension GPTDriverError: LocalizedError, CustomStringConvertible {
+    var errorDescription: String? { description }
+
+    var description: String {
+        switch self {
+        case .executionFailed(let message):
+            return "GPT Driver execution failed: \(message)"
+        case .invalidResponse:
+            return "Unexpected response from the GPT Driver backend."
+        case .missingSessionId:
+            return "No GPT Driver session has been started."
+        case .creationFailed(let message):
+            return "Could not start the GPT Driver session: \(message)"
+        case .usageLimitReached(let message):
+            return message
+        }
+    }
 }
 
 /// Caching mode for GPT Driver interactions
@@ -1292,7 +1352,16 @@ public class GptDriver {
                     }
                     return data
                 }
-                
+
+                if httpResponse.statusCode == GPTDriverError.paymentRequiredStatusCode {
+                    // Surfaced as the backend's own sentence: a run stopped for
+                    // billing reasons is not an SDK failure to debug.
+                    let message = GPTDriverError.billingMessage(from: data)
+                    log(.error, "GPT Driver usage limit reached", metadata: ["message": message])
+                    print("[gptdriver] GPT Driver usage limit reached: \(message)")
+                    throw GPTDriverError.usageLimitReached(message)
+                }
+
                 if shouldRetry(statusCode: httpResponse.statusCode) && attempt < maxRetries - 1 {
                     let delay = exponentialBackoff(attempt: attempt)
                     log(.info, "Request failed with retryable status", metadata: [
