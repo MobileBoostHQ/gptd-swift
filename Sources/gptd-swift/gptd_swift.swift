@@ -94,6 +94,19 @@ public enum CachingMode: String {
     case fullScreen = "FULL_SCREEN"
 }
 
+/// Whether a false condition is meant to fail the test.
+///
+/// `assert` and `checkBulk` are the same request to the same endpoint with the
+/// same command string; the difference is entirely in what this client does
+/// with the verdicts afterwards (assert marks the session failed and throws,
+/// checkBulk returns them and the test carries on). Sending the mode is what
+/// lets the session screen tell a deliberate check apart from an assertion
+/// that broke the test, instead of painting both red.
+enum AssertionMode: String {
+    case assert
+    case check
+}
+
 enum GPTLogLevel {
     case debug
     case info
@@ -1082,7 +1095,7 @@ public class GptDriver {
             ])
             XCTContext.runActivity(named: "GPTDriver Native CheckBulk Failed, AI Fallback") { _ in }
             return try performSync(timeout: timeout) {
-                try await self._checkBulkAsync(conditions, maxRetries: maxRetries, retryDelay: retryDelay)
+                try await self._checkBulkAsync(conditions, maxRetries: maxRetries, retryDelay: retryDelay, mode: .check)
             }
         } else {
             log(.info, "Native checkBulk succeeded", metadata: ["count": conditions.count])
@@ -1468,7 +1481,7 @@ public class GptDriver {
         ])
         
         do {
-            let results = try await _checkBulkAsync([assertion], maxRetries: maxRetries, retryDelay: retryDelay)
+            let results = try await _checkBulkAsync([assertion], maxRetries: maxRetries, retryDelay: retryDelay, mode: .assert)
             guard let firstResult = results.values.first, firstResult else {
                 let message = "Failed assertion: \(assertion)"
                 log(.error, "Assert failed", metadata: ["assertion": assertion])
@@ -1509,7 +1522,7 @@ public class GptDriver {
         ])
         
         do {
-            let results = try await _checkBulkAsync(assertions, maxRetries: maxRetries, retryDelay: retryDelay)
+            let results = try await _checkBulkAsync(assertions, maxRetries: maxRetries, retryDelay: retryDelay, mode: .assert)
 
             var failedAssertions: [String] = []
             for (index, result) in results.values.enumerated() {
@@ -1546,12 +1559,12 @@ public class GptDriver {
     /// - Returns: Dictionary mapping conditions to boolean results
     public func checkBulk(_ conditions: [String], maxRetries: Int = 2, retryDelay: TimeInterval = 1.0, timeout: TimeInterval = 60) throws -> [String: Bool] {
         return try performSync(timeout: timeout) {
-            try await self._checkBulkAsync(conditions, maxRetries: maxRetries, retryDelay: retryDelay)
+            try await self._checkBulkAsync(conditions, maxRetries: maxRetries, retryDelay: retryDelay, mode: .check)
         }
     }
 
     /// Internal async implementation of checkBulk
-    private func _checkBulkAsync(_ conditions: [String], maxRetries: Int = 2, retryDelay: TimeInterval = 1.0) async throws -> [String: Bool] {
+    private func _checkBulkAsync(_ conditions: [String], maxRetries: Int = 2, retryDelay: TimeInterval = 1.0, mode: AssertionMode) async throws -> [String: Bool] {
         if !appiumSessionStarted || gptDriverSessionId == nil {
             try await startSession()
         }
@@ -1588,6 +1601,10 @@ public class GptDriver {
                     "base64_screenshot": screenshotBase64,
                     "assertions": conditions,
                     "command": "Assert: \(String(describing: try? JSONSerialization.data(withJSONObject: conditions, options: [])))",
+                    // The command string is identical for both, so this is the
+                    // only thing that tells the session screen whether a false
+                    // verdict below broke the test or was asked for.
+                    "assertion_mode": mode.rawValue,
                     "step_counter": currentStep,
                     "caching_mode": cachingMode.rawValue
                 ]
