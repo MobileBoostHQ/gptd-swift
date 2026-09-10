@@ -246,10 +246,113 @@ class NativeActionExecutor {
     }
 
     // MARK: - Multi-touch (pinch) support
-    private func executeMultiPointerIfPossible(_ groups: [WebDriverActionGroup], cacheHit: Bool) async -> Bool {
-        // For now we only handle the canonical pinch payload: exactly two pointer groups.
-        guard groups.count == 2, groups.allSatisfy({ $0.type == "pointer" }) else { return false }
 
+    /// Performs [groups] as one gesture if they describe fingers that act at the same time.
+    ///
+    /// Groups shaped like a coordinated gesture -- a pinch to zoom, a two-finger rotate -- have to be
+    /// injected as one interleaved stream of events, or they are not that gesture at all. The W3C
+    /// Actions format the backend speaks says as much by giving each finger its own `pointer` group,
+    /// so that shape is recognised here and synthesized as a single event.
+    ///
+    /// Nothing constrains where the fingers may go: each one's start, end and any waypoints between
+    /// come from the payload, so the agent chooses its own points on screen -- pinching about any
+    /// centre, at any angle, over any distance -- and a zoom is simply the case where the two paths
+    /// move apart or together. That matters for content the screen does not centre on: a map under a
+    /// drawer, a photo filling half the screen. Where the synthesizer is unavailable the older
+    /// element-centred pinch still runs, so such a payload degrades instead of failing.
+    private func executeMultiPointerIfPossible(_ groups: [WebDriverActionGroup], cacheHit: Bool) async -> Bool {
+        guard let paths = PointerPath.concurrentPaths(from: groups) else { return false }
+
+        if await performSynthesizedGesture(paths, cacheHit: cacheHit) {
+            return true
+        }
+
+        return await performElementPinch(groups, cacheHit: cacheHit)
+    }
+
+    /// Moves every finger along its own path, as one gesture, about whatever centre the payload asked
+    /// for. Returns false if this runtime cannot synthesize the event, leaving the caller a fallback.
+    private func performSynthesizedGesture(_ paths: [PointerPath], cacheHit: Bool) async -> Bool {
+        guard GPTDMultiTouchAvailable() else {
+            log(.warning, "XCTest event synthesizer unavailable; falling back to an element pinch")
+            return false
+        }
+
+        let duration = paths.map(\.duration).max() ?? PointerPath.defaultDuration
+        let steps = Self.gestureSteps(for: duration)
+        let offsets = (0...steps).map { NSNumber(value: duration * Double($0) / Double(steps)) }
+
+        // Screen points, the unit the synthesizer works in; the backend sends pixels, as taps do.
+        let scale = Double(await MainActor.run { UIScreen.main.scale })
+        let sampled: [[NSValue]] = paths.map { path in
+            path.sample(count: steps + 1).map { point in
+                NSValue(cgPoint: CGPoint(x: point.x / scale, y: point.y / scale))
+            }
+        }
+
+        let orientation = await MainActor.run { Self.interfaceOrientationValue() }
+        let cacheLabel = cacheHit ? " [cached]" : ""
+        let description = paths.enumerated()
+            .map { "finger \($0.offset + 1): \($0.element.describe())" }
+            .joined(separator: ", ")
+
+        log(.info, "Multi-touch gesture\(cacheLabel)", metadata: [
+            "pointers": paths.count,
+            "samples": steps + 1,
+            "durationSeconds": duration,
+            "paths": description
+        ])
+        await MainActor.run {
+            XCTContext.runActivity(named: "GPTDriver Multi-touch (\(paths.count) fingers)\(cacheLabel)") { _ in }
+        }
+
+        // On a background thread on purpose: the call blocks until the runner acknowledges the
+        // gesture, and the acknowledgement may itself be delivered on the main thread.
+        let failure: NSError? = await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                var error: NSError?
+                let performed = GPTDPerformMultiTouch(sampled, offsets, orientation, duration + 5.0, &error)
+                continuation.resume(returning: performed ? nil : (error ?? PointerPath.unknownFailure))
+            }
+        }
+
+        switch failure {
+        case .none:
+            return true
+        case .some(let error):
+            // A failure here is the runner refusing to inject the events, which is not the same as the
+            // app ignoring the gesture, and is worth telling apart when a zoom appears to do nothing.
+            log(.warning, "Multi-touch gesture not synthesized; falling back to an element pinch",
+                metadata: ["error": error.localizedDescription])
+            return false
+        }
+    }
+
+    /// The number of samples a gesture is injected in. Too few and a gesture detector sees one jump
+    /// instead of a pinch; too many and a one-second zoom takes several seconds to deliver.
+    private static func gestureSteps(for duration: TimeInterval) -> Int {
+        let requested = Int((duration * 1000.0) / 10.0)
+        return min(max(requested, 10), 200)
+    }
+
+    /// UIInterfaceOrientation raw value for the event record. The device and interface enumerations
+    /// disagree about which way "landscape left" faces, and they cancel out to the same raw values.
+    @MainActor
+    private static func interfaceOrientationValue() -> Int {
+        switch XCUIDevice.shared.orientation {
+        case .portraitUpsideDown: return UIInterfaceOrientation.portraitUpsideDown.rawValue
+        case .landscapeLeft: return UIInterfaceOrientation.landscapeRight.rawValue
+        case .landscapeRight: return UIInterfaceOrientation.landscapeLeft.rawValue
+        default: return UIInterfaceOrientation.portrait.rawValue
+        }
+    }
+
+    /// The pinch as XCTest performs it publicly: about the centre of the element under the gesture,
+    /// by a scale inferred from how far the fingers travel. Kept for runtimes without the synthesizer.
+    ///
+    /// It cannot honour where the payload put the fingers -- `pinchWithScale:velocity:` pinches about
+    /// an element's own centre -- so a pinch aimed at a corner of a map lands on the middle of it.
+    private func performElementPinch(_ groups: [WebDriverActionGroup], cacheHit: Bool) async -> Bool {
         guard
             let pinch = PinchSpec.from(pointerGroupActions: groups.map(\.actions))
         else {
@@ -515,6 +618,112 @@ class NativeActionExecutor {
 }
 
 // MARK: - Pinch parsing + XCTest multi-touch synthesis
+
+/// One finger's journey through a gesture: where it touches down, where it lifts, and any waypoints
+/// in between, in the pixel space the backend works in.
+private struct PointerPath {
+    /// Used when a gesture's own actions declare no travel time. Matches the drag default above.
+    static let defaultDuration: TimeInterval = 1.0
+
+    static let unknownFailure = NSError(
+        domain: "io.mobileboost.gptdriver.multitouch",
+        code: 0,
+        userInfo: [NSLocalizedDescriptionKey: "The gesture was not performed and reported no reason"]
+    )
+
+    let waypoints: [CGPoint]
+    let duration: TimeInterval
+
+    /// Reads [groups] as the fingers of one multi-touch gesture, or nil if they are not one and
+    /// should be run a group at a time instead.
+    ///
+    /// Every group has to be a pointer group tracing a path of at least two points, and there have to
+    /// be at least two of them: a tap or a keystroke among them means the groups were never meant to
+    /// happen at once, and one finger alone is not a gesture worth synthesizing.
+    static func concurrentPaths(from groups: [WebDriverActionGroup]) -> [PointerPath]? {
+        guard groups.count >= 2, groups.allSatisfy({ $0.type == "pointer" }) else { return nil }
+
+        var paths: [PointerPath] = []
+        for group in groups {
+            guard let path = PointerPath(actions: group.actions) else { return nil }
+            paths.append(path)
+        }
+        return paths
+    }
+
+    init?(actions: [WebDriverAction]) {
+        let moves = actions.filter { $0.type == "pointerMove" }
+        let points: [CGPoint] = moves.compactMap { action in
+            guard let x = action.x, let y = action.y else { return nil }
+            return CGPoint(x: x, y: y)
+        }
+        guard points.count >= 2 else { return nil }
+
+        // W3C puts the travel time on the pointerMove that performs it, so the move that only places
+        // the finger before it touches down carries none. Summing them gives the time the gesture
+        // itself asked for.
+        let declaredMilliseconds = moves.reduce(0) { $0 + ($1.duration ?? 0) }
+
+        self.waypoints = points
+        self.duration = declaredMilliseconds > 0
+            ? TimeInterval(declaredMilliseconds) / 1000.0
+            : PointerPath.defaultDuration
+    }
+
+    /// Samples the path into exactly [count] points spread evenly along its length.
+    ///
+    /// Spacing by distance rather than by waypoint is what keeps fingers travelling different
+    /// distances -- or given a different number of waypoints -- moving in proportion to one another
+    /// for the whole gesture, which is the difference between a pinch and two fingers drifting out of
+    /// step.
+    func sample(count: Int) -> [CGPoint] {
+        guard count > 1, let first = waypoints.first, let last = waypoints.last else {
+            return waypoints
+        }
+
+        let lengths: [CGFloat] = zip(waypoints, waypoints.dropFirst()).map { from, to in
+            hypot(to.x - from.x, to.y - from.y)
+        }
+        let total = lengths.reduce(0, +)
+
+        // A finger asked to hold still still needs its samples, and asking how far along a
+        // zero-length path it is would divide by zero.
+        guard total > 0 else { return Array(repeating: first, count: count) }
+
+        return (0..<count).map { index in
+            index == count - 1
+                ? last
+                : point(at: total * CGFloat(index) / CGFloat(count - 1), lengths: lengths)
+        }
+    }
+
+    /// The point [distance] along the polyline through the waypoints.
+    private func point(at distance: CGFloat, lengths: [CGFloat]) -> CGPoint {
+        var remaining = distance
+
+        for (index, length) in lengths.enumerated() {
+            if remaining <= length || index == lengths.count - 1 {
+                let from = waypoints[index]
+                let to = waypoints[index + 1]
+                let fraction = length == 0 ? 0 : min(max(remaining / length, 0), 1)
+                return CGPoint(
+                    x: from.x + (to.x - from.x) * fraction,
+                    y: from.y + (to.y - from.y) * fraction
+                )
+            }
+            remaining -= length
+        }
+
+        return waypoints[waypoints.count - 1]
+    }
+
+    func describe() -> String {
+        let route = waypoints
+            .map { "(\(Int($0.x)),\(Int($0.y)))" }
+            .joined(separator: " -> ")
+        return "\(route) over \(Int(duration * 1000))ms"
+    }
+}
 
 private struct PinchSpec {
     let start1: (x: Double, y: Double)
