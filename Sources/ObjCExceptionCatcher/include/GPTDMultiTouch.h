@@ -3,38 +3,33 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
-/// Error domain for failures reported by ``GPTDPerformMultiTouch``.
 FOUNDATION_EXPORT NSString * const GPTDMultiTouchErrorDomain;
 
-/// Whether the XCTest event synthesizer this file drives is present in the running runtime.
+/// Whether the private XCTest event synthesizer is present in this runtime.
 ///
-/// XCTest exposes no public way to move two fingers along paths of the caller's choosing:
-/// `-[XCUIElement pinchWithScale:velocity:]` pinches about the centre of an element, which is
-/// exactly the gesture that cannot zoom content the element does not centre on. The synthesizer
-/// underneath it can, and is what Appium's WebDriverAgent has driven for years, so the SDK reaches
-/// for it through the runtime rather than linking it. Being private, it may be absent or renamed in
-/// a future Xcode, and callers are expected to keep a fallback for when this returns NO.
+/// XCTest has no public API for moving several fingers along arbitrary paths:
+/// `-[XCUIElement pinchWithScale:velocity:]` always pinches about the element's
+/// centre. The synthesizer underneath it (the one WebDriverAgent uses) is reached
+/// through the runtime, so it may be missing on a future Xcode. Keep a fallback.
 FOUNDATION_EXPORT BOOL GPTDMultiTouchAvailable(void);
 
-/// Injects several touch paths as ONE gesture, every finger moving at the same time.
+/// Injects one touch path per finger as a single gesture.
 ///
-/// Running the paths one after another would perform two drags rather than a pinch: real input, the
-/// wrong gesture, and nothing anywhere to say so. They are dispatched as a single synthesized event
-/// so the app under test receives them the way it receives a person's fingers.
+/// Each path is a list of waypoints in screen points. The synthesizer interpolates
+/// between them and reaches waypoint `i` at `offsets[i]` seconds after the gesture
+/// starts, so a pinch is two fingers with two waypoints each. Do not pre-sample paths:
+/// events closer together than about a frame make the synthesizer replay the whole
+/// path as one jump (Xcode 26.2: 30ms spacing works, 15ms collapses).
 ///
-/// @param paths one array of NSValue-wrapped CGPoints per finger, in screen points, already sampled
-///   onto the shared clock given by @c offsets. Every path must hold exactly as many points as
-///   @c offsets, so that sample @c i of each finger happens at the same moment.
-/// @param offsets seconds since the start of the gesture, one per sample, ascending from 0.
-/// @param interfaceOrientation UIInterfaceOrientation raw value the event is recorded in.
-/// @param timeout seconds to wait for the runner to acknowledge the gesture.
-/// @param error set when the gesture could not be built, dispatched, or acknowledged in time.
-/// @return YES if the event was dispatched and acknowledged.
+/// Blocks until the runner acknowledges the gesture. Call it off the main thread,
+/// where the acknowledgement may be delivered.
 ///
-/// @note Blocks the calling thread until the gesture completes, so call it off the main thread:
-///   the acknowledgement may be delivered there.
+/// @param paths    one array of NSValue-wrapped CGPoints per finger, at least two each
+/// @param offsets  one array per finger, seconds from gesture start, ascending from 0
+/// @param interfaceOrientation  UIInterfaceOrientation raw value
+/// @param timeout  seconds to wait for the acknowledgement
 FOUNDATION_EXPORT BOOL GPTDPerformMultiTouch(NSArray<NSArray<NSValue *> *> *paths,
-                                             NSArray<NSNumber *> *offsets,
+                                             NSArray<NSArray<NSNumber *> *> *offsets,
                                              NSInteger interfaceOrientation,
                                              NSTimeInterval timeout,
                                              NSError * _Nullable * _Nullable error);

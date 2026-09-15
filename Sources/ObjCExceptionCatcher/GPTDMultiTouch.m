@@ -1,18 +1,15 @@
 #import "GPTDMultiTouch.h"
+#import <UIKit/UIKit.h> // NSValue.CGPointValue
 #import <objc/runtime.h>
 
 NSString * const GPTDMultiTouchErrorDomain = @"io.mobileboost.gptdriver.multitouch";
 
 static NSString * const kEventName = @"GPTDriver multi-touch";
 
-#pragma mark - Private XCTest surface
+#pragma mark - Private XCTest API
 
-// Declared, never linked. Every class below is reached through NSClassFromString, so nothing here
-// references a private symbol at link time: an Xcode that renames or drops one of them leaves the
-// SDK with a working fallback instead of a test bundle that will not build.
-//
-// Declaring the methods rather than casting objc_msgSend keeps ARC in charge of the objects, and
-// keeps the call sites readable.
+// Declared here and resolved with NSClassFromString, so nothing private is referenced
+// at link time. If Xcode renames one of these we lose the feature, not the build.
 
 @interface XCPointerEventPath : NSObject
 - (instancetype)initForTouchAtPoint:(CGPoint)point offset:(NSTimeInterval)offset;
@@ -26,9 +23,20 @@ static NSString * const kEventName = @"GPTDriver multi-touch";
 - (void)addPointerEventPath:(XCPointerEventPath *)path;
 @end
 
+// Implemented by XCUIDevice's eventSynthesizer, which is the XCTRunnerDaemonSession.
+// The completion takes (BOOL, NSError *). Some class-dumped headers declare a single
+// NSError argument; that receives the BOOL as a pointer and crashes the runner.
+@protocol GPTDEventSynthesizing <NSObject>
+- (void)synthesizeEvent:(id)event completion:(void (^)(BOOL succeeded, NSError * _Nullable error))completion;
+@end
+
 @interface XCTRunnerDaemonSession : NSObject
 + (instancetype)sharedSession;
-- (void)synthesizeEvent:(id)event completion:(void (^)(NSError * _Nullable))completion;
+@end
+
+@protocol GPTDDeviceSynthesizerSource <NSObject>
++ (id)sharedDevice;
+- (id)eventSynthesizer;
 @end
 
 #pragma mark - Helpers
@@ -61,7 +69,25 @@ BOOL GPTDMultiTouchAvailable(void) {
            [sessionClass instancesRespondToSelector:@selector(synthesizeEvent:completion:)];
 }
 
-/// One finger's path: down at the first sample, a move at every sample after it, then up.
+// Same lookup as WebDriverAgent: XCUIDevice's synthesizer, else the daemon session.
+static id<GPTDEventSynthesizing> GPTDEventSynthesizer(void) {
+    Class<GPTDDeviceSynthesizerSource> deviceClass = NSClassFromString(@"XCUIDevice");
+    if (deviceClass != Nil && [(Class)deviceClass respondsToSelector:@selector(sharedDevice)]) {
+        id device = [deviceClass sharedDevice];
+        if ([device respondsToSelector:@selector(eventSynthesizer)]) {
+            id synthesizer = [(id<GPTDDeviceSynthesizerSource>)device eventSynthesizer];
+            if ([synthesizer respondsToSelector:@selector(synthesizeEvent:completion:)]) {
+                return synthesizer;
+            }
+        }
+    }
+
+    Class sessionClass = NSClassFromString(@"XCTRunnerDaemonSession");
+    id session = [sessionClass sharedSession];
+    return [session respondsToSelector:@selector(synthesizeEvent:completion:)] ? session : nil;
+}
+
+// Touch down at the first point, move through the rest, lift at the last.
 static XCPointerEventPath *GPTDBuildPointerEventPath(NSArray<NSValue *> *points,
                                                      NSArray<NSNumber *> *offsets) {
     Class pathClass = NSClassFromString(@"XCPointerEventPath");
@@ -83,15 +109,13 @@ static XCPointerEventPath *GPTDBuildPointerEventPath(NSArray<NSValue *> *points,
     return path;
 }
 
-/// The record every finger is added to. Xcode has spelled its initialiser both ways over the years,
-/// so both are tried before giving up.
+// The initialiser has had both spellings across Xcode versions.
 static XCSynthesizedEventRecord *GPTDBuildEventRecord(NSInteger interfaceOrientation) {
     Class recordClass = NSClassFromString(@"XCSynthesizedEventRecord");
     if (recordClass == Nil) {
         return nil;
     }
 
-    // Asked of the class, not of a half-built instance, so alloc and init stay in one expression.
     if ([recordClass instancesRespondToSelector:@selector(initWithName:interfaceOrientation:)]) {
         return [[recordClass alloc] initWithName:kEventName
                             interfaceOrientation:interfaceOrientation];
@@ -105,7 +129,7 @@ static XCSynthesizedEventRecord *GPTDBuildEventRecord(NSInteger interfaceOrienta
 #pragma mark - Public entry point
 
 BOOL GPTDPerformMultiTouch(NSArray<NSArray<NSValue *> *> *paths,
-                           NSArray<NSNumber *> *offsets,
+                           NSArray<NSArray<NSNumber *> *> *offsets,
                            NSInteger interfaceOrientation,
                            NSTimeInterval timeout,
                            NSError * _Nullable * _Nullable error) {
@@ -114,16 +138,18 @@ BOOL GPTDPerformMultiTouch(NSArray<NSArray<NSValue *> *> *paths,
         return NO;
     }
 
-    if (offsets.count < 2) {
-        if (error) { *error = GPTDError(2, @"A multi-touch gesture needs at least two samples"); }
+    if (offsets.count != paths.count) {
+        if (error) { *error = GPTDError(2, @"Every path needs its own list of offsets"); }
         return NO;
     }
 
-    for (NSArray<NSValue *> *points in paths) {
-        if (points.count != offsets.count) {
-            if (error) {
-                *error = GPTDError(3, @"Every path must carry one point per sample offset");
-            }
+    for (NSUInteger index = 0; index < paths.count; index++) {
+        if (paths[index].count < 2) {
+            if (error) { *error = GPTDError(3, @"Every path needs at least a start and an end"); }
+            return NO;
+        }
+        if (paths[index].count != offsets[index].count) {
+            if (error) { *error = GPTDError(3, @"Every path must carry one offset per waypoint"); }
             return NO;
         }
     }
@@ -141,8 +167,8 @@ BOOL GPTDPerformMultiTouch(NSArray<NSArray<NSValue *> *> *paths,
         return NO;
     }
 
-    for (NSArray<NSValue *> *points in paths) {
-        XCPointerEventPath *path = GPTDBuildPointerEventPath(points, offsets);
+    for (NSUInteger index = 0; index < paths.count; index++) {
+        XCPointerEventPath *path = GPTDBuildPointerEventPath(paths[index], offsets[index]);
         if (path == nil) {
             if (error) { *error = GPTDError(6, @"Could not create a pointer event path"); }
             return NO;
@@ -150,10 +176,9 @@ BOOL GPTDPerformMultiTouch(NSArray<NSArray<NSValue *> *> *paths,
         [record addPointerEventPath:path];
     }
 
-    Class sessionClass = NSClassFromString(@"XCTRunnerDaemonSession");
-    XCTRunnerDaemonSession *session = [sessionClass sharedSession];
-    if (session == nil) {
-        if (error) { *error = GPTDError(7, @"The XCTest runner session is unavailable"); }
+    id<GPTDEventSynthesizing> synthesizer = GPTDEventSynthesizer();
+    if (synthesizer == nil) {
+        if (error) { *error = GPTDError(7, @"The XCTest event synthesizer is unavailable"); }
         return NO;
     }
 
@@ -161,8 +186,12 @@ BOOL GPTDPerformMultiTouch(NSArray<NSArray<NSValue *> *> *paths,
     dispatch_semaphore_t finished = dispatch_semaphore_create(0);
 
     @try {
-        [session synthesizeEvent:record completion:^(NSError * _Nullable completionError) {
-            dispatchError = completionError;
+        [synthesizer synthesizeEvent:record completion:^(BOOL succeeded, NSError * _Nullable completionError) {
+            if (!succeeded && completionError == nil) {
+                dispatchError = GPTDError(10, @"The runner reported failure without an error");
+            } else {
+                dispatchError = completionError;
+            }
             dispatch_semaphore_signal(finished);
         }];
     } @catch (NSException *exception) {

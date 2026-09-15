@@ -1,5 +1,8 @@
 #import <Foundation/Foundation.h>
 
+// Umbrella header (it shares the target's name); other public headers must be imported here.
+#import "GPTDMultiTouch.h"
+
 NS_ASSUME_NONNULL_BEGIN
 
 /// Executes the given block inside an Objective-C @try/@catch.
