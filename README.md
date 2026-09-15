@@ -55,6 +55,16 @@ let gptDriver = GptDriver(
 
 The live session URL is printed on session creation and is also available via `gptDriver.sessionURL` or the `onSessionCreated` callback.
 
+It is also recorded as an XCTest activity, so it appears in the `xcodebuild` log and in the `.xcresult` on simulators, physical devices and device farms such as Firebase Test Lab, where the test runner's stdout is not captured:
+
+```
+t =    12.34s GPTDriver Live Session URL: https://app.mobileboost.io/gpt-driver/sessions/<id>
+...
+t =    98.76s GPTDriver Session success: https://app.mobileboost.io/gpt-driver/sessions/<id>
+```
+
+On Buildkite, grep the xcodebuild output for `GPTDriver Live Session URL` and pass the match to `buildkite-agent annotate` to surface it at the top of the build.
+
 ### Executing commands
 
 ```swift

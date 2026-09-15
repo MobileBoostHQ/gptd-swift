@@ -1376,7 +1376,11 @@ public class GptDriver {
         self.gptDriverSessionId = sessionId
         self.sessionURL = sessionURL
 
-        XCTContext.runActivity(named: "GPTDriver Live Session URL") { activity in
+        // The URL goes in the activity name on purpose. Activities reach the xcodebuild log through
+        // the test manager connection on every destination, whereas on a physical device the runner's
+        // stdout and stderr are discarded, so the print and os_log lines above never make it into the
+        // log of a CI run such as Firebase Test Lab.
+        XCTContext.runActivity(named: "GPTDriver Live Session URL: \(sessionURL)") { activity in
             if let url = URL(string: sessionURL) {
                 let tempDirectory = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
                 let fileName = "gptd-session-link.webloc"
@@ -1885,6 +1889,10 @@ public class GptDriver {
         }
         
         log(.info, "Stopping session", metadata: ["status": status])
+        if let sessionURL {
+            // Repeated at the end so it is next to the failure in a long log.
+            XCTContext.runActivity(named: "GPTDriver Session \(status): \(sessionURL)") { _ in }
+        }
         
         let requestUrl = gptDriverBaseUrl
             .appendingPathComponent("sessions")
