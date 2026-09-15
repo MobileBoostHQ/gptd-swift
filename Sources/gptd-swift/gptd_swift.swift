@@ -566,6 +566,24 @@ public class GptDriver {
     private let deviceName: String?
     private let platform: String?
     private let platformVersion: String?
+
+    /// The platform reported to Appium and to the GPT Driver backend.
+    ///
+    /// `platform` is only ever nil on the native XCUITest path: the Appium
+    /// initializer takes it non-optionally. That path is iOS by
+    /// construction - it drives an `XCUIApplication`, it measures the
+    /// screen with `UIScreen.main.nativeBounds`, and this file imports
+    /// XCTest and UIKit - so there is no device it can run against that is
+    /// not an iOS device.
+    ///
+    /// This exists because the two call sites used to disagree.
+    /// `createAppiumSession` defaulted nil to "iOS" while
+    /// `createGptDriverSession` sent `platform ?? ""`, so every native
+    /// session was recorded with an empty platform: invisible in the
+    /// platform breakdown on the sessions dashboard, and passed to the
+    /// agent as an empty string. One property, used by both, is what stops
+    /// them drifting apart again.
+    private var resolvedPlatform: String { platform ?? "iOS" }
     
     private let nativeApp: XCUIApplication?
     
@@ -1119,7 +1137,7 @@ public class GptDriver {
         guard let appiumUrl = appiumServerUrl else { return "native" }
         
         let url = appiumUrl.appendingPathComponent("session")
-        let finalPlatform = platform ?? "iOS"
+        let finalPlatform = resolvedPlatform
         let capabilities: [String: Any] = [
             "alwaysMatch": [
                 "platformName": finalPlatform,
@@ -1168,7 +1186,16 @@ public class GptDriver {
             "api_key": apiKey,
             "appium_session_id": appiumSessionId,
             "device_config": [
-                "platform": platform ?? "",
+                "platform": resolvedPlatform,
+                // `device` and `os` are deliberately still sent empty on the
+                // native path rather than filled from `UIDevice`. The backend
+                // matches a session against its cached baselines on these
+                // exact fields, so populating them would stop every existing
+                // baseline from matching - and for an organisation with
+                // strict SDK baselines it would add an `os` filter that no
+                // historical session can satisfy. Filling them is worth
+                // doing, but it is a separate change that needs its own
+                // backfill first.
                 "device": deviceName ?? "",
                 "os": platformVersion ?? "",
                 "screenResolution": deviceResolution
