@@ -246,10 +246,100 @@ class NativeActionExecutor {
     }
 
     // MARK: - Multi-touch (pinch) support
-    private func executeMultiPointerIfPossible(_ groups: [WebDriverActionGroup], cacheHit: Bool) async -> Bool {
-        // For now we only handle the canonical pinch payload: exactly two pointer groups.
-        guard groups.count == 2, groups.allSatisfy({ $0.type == "pointer" }) else { return false }
 
+    /// Runs the groups as one gesture if they are several pointer groups moving at once (a pinch,
+    /// a two-finger rotate). Each finger follows the path its payload describes, so the agent can
+    /// pinch about any point on screen, not just the centre of an element. Falls back to the
+    /// element-centred pinch where the synthesizer is unavailable.
+    private func executeMultiPointerIfPossible(_ groups: [WebDriverActionGroup], cacheHit: Bool) async -> Bool {
+        guard let paths = PointerPath.concurrentPaths(from: groups) else { return false }
+
+        if await performSynthesizedGesture(paths, cacheHit: cacheHit) {
+            return true
+        }
+
+        return await performElementPinch(groups, cacheHit: cacheHit)
+    }
+
+    /// Returns false if the runtime cannot synthesize the event, so the caller can fall back.
+    private func performSynthesizedGesture(_ paths: [PointerPath], cacheHit: Bool) async -> Bool {
+        guard GPTDMultiTouchAvailable() else {
+            log(.warning, "XCTest event synthesizer unavailable; falling back to an element pinch")
+            return false
+        }
+
+        let declared = paths.map(\.duration).max() ?? PointerPath.defaultDuration
+        let travel = max(declared, Self.minimumTravel)
+
+        // The backend sends pixels; the synthesizer wants points.
+        let scale = Double(await MainActor.run { UIScreen.main.scale })
+        var points: [[NSValue]] = []
+        var offsets: [[NSNumber]] = []
+        for path in paths {
+            let timed = path.timedWaypoints(over: travel)
+            points.append(timed.map { NSValue(cgPoint: CGPoint(x: $0.point.x / scale, y: $0.point.y / scale)) })
+            offsets.append(timed.map { NSNumber(value: $0.offset) })
+        }
+
+        let orientation = await MainActor.run { Self.interfaceOrientationValue() }
+        let cacheLabel = cacheHit ? " [cached]" : ""
+        let description = paths.enumerated()
+            .map { "finger \($0.offset + 1): \($0.element.describe())" }
+            .joined(separator: ", ")
+
+        log(.info, "Multi-touch gesture\(cacheLabel)", metadata: [
+            "pointers": paths.count,
+            "travelSeconds": travel,
+            "paths": description
+        ])
+        await MainActor.run {
+            XCTContext.runActivity(named: "GPTDriver Multi-touch (\(paths.count) fingers)\(cacheLabel)") { _ in }
+        }
+
+        // Off the main thread: the call blocks until the runner acknowledges the gesture, and the
+        // acknowledgement may arrive on the main thread.
+        let startedAt = Date()
+        let failure: NSError? = await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                var error: NSError?
+                let performed = GPTDPerformMultiTouch(points, offsets, orientation, travel + 5.0, &error)
+                continuation.resume(returning: performed ? nil : (error ?? PointerPath.unknownFailure))
+            }
+        }
+        log(.info, "Multi-touch gesture acknowledged", metadata: [
+            "elapsedSeconds": Date().timeIntervalSince(startedAt)
+        ])
+
+        switch failure {
+        case .none:
+            return true
+        case .some(let error):
+            log(.warning, "Multi-touch gesture not synthesized; falling back to an element pinch",
+                metadata: ["error": error.localizedDescription])
+            return false
+        }
+    }
+
+    /// Floor on gesture duration. Faster than this a pinch is a flick, and the app's inertia decides
+    /// the outcome: on a map the same 4x pinch zoomed anywhere from 7x to 60x at 100ms, and exactly
+    /// 4x every time from 300ms up.
+    private static let minimumTravel: TimeInterval = 0.3
+
+    /// UIDeviceOrientation and UIInterfaceOrientation disagree on which way landscape faces.
+    @MainActor
+    private static func interfaceOrientationValue() -> Int {
+        switch XCUIDevice.shared.orientation {
+        case .portraitUpsideDown: return UIInterfaceOrientation.portraitUpsideDown.rawValue
+        case .landscapeLeft: return UIInterfaceOrientation.landscapeRight.rawValue
+        case .landscapeRight: return UIInterfaceOrientation.landscapeLeft.rawValue
+        default: return UIInterfaceOrientation.portrait.rawValue
+        }
+    }
+
+    /// XCTest's public pinch: about the centre of the element under the gesture, by a scale
+    /// inferred from the fingers' travel. Cannot honour where the payload put the fingers.
+    /// Kept for runtimes without the synthesizer.
+    private func performElementPinch(_ groups: [WebDriverActionGroup], cacheHit: Bool) async -> Bool {
         guard
             let pinch = PinchSpec.from(pointerGroupActions: groups.map(\.actions))
         else {
@@ -515,6 +605,98 @@ class NativeActionExecutor {
 }
 
 // MARK: - Pinch parsing + XCTest multi-touch synthesis
+
+/// One finger's path through a gesture, in the backend's pixel coordinates.
+private struct PointerPath {
+    /// Used when the payload declares no duration.
+    static let defaultDuration: TimeInterval = 1.0
+
+    static let unknownFailure = NSError(
+        domain: "io.mobileboost.gptdriver.multitouch",
+        code: 0,
+        userInfo: [NSLocalizedDescriptionKey: "The gesture was not performed and reported no reason"]
+    )
+
+    let waypoints: [CGPoint]
+    let duration: TimeInterval
+
+    /// The groups as fingers of one gesture, or nil if they should run one at a time instead:
+    /// at least two groups, all pointer groups, each moving through at least two points.
+    static func concurrentPaths(from groups: [WebDriverActionGroup]) -> [PointerPath]? {
+        guard groups.count >= 2, groups.allSatisfy({ $0.type == "pointer" }) else { return nil }
+
+        var paths: [PointerPath] = []
+        for group in groups {
+            guard let path = PointerPath(actions: group.actions) else { return nil }
+            paths.append(path)
+        }
+        return paths
+    }
+
+    init?(actions: [WebDriverAction]) {
+        let moves = actions.filter { $0.type == "pointerMove" }
+        let points: [CGPoint] = moves.compactMap { action in
+            guard let x = action.x, let y = action.y else { return nil }
+            return CGPoint(x: x, y: y)
+        }
+        guard points.count >= 2 else { return nil }
+
+        // The initial pointerMove only positions the finger and carries no duration.
+        let declaredMilliseconds = moves.reduce(0) { $0 + ($1.duration ?? 0) }
+
+        self.waypoints = points
+        self.duration = declaredMilliseconds > 0
+            ? TimeInterval(declaredMilliseconds) / 1000.0
+            : PointerPath.defaultDuration
+    }
+
+    /// Events closer than this make the synthesizer replay the whole path as one jump
+    /// (Xcode 26.2: 30ms works, 15ms collapses). Tighter waypoints are thinned.
+    static let minimumWaypointSpacing: TimeInterval = 0.04
+
+    /// The waypoints with the time each is reached, in seconds from the start of the gesture.
+    ///
+    /// Time is spread by distance, so the finger moves at constant speed and fingers on routes of
+    /// different lengths arrive together. Only the waypoints are handed over; the synthesizer
+    /// interpolates between them itself. Pre-sampling the path at 10ms intervals makes it replay
+    /// everything in a single frame, which turns a pinch into a flick.
+    func timedWaypoints(over travel: TimeInterval) -> [(point: CGPoint, offset: TimeInterval)] {
+        let lengths: [CGFloat] = zip(waypoints, waypoints.dropFirst()).map { from, to in
+            hypot(to.x - from.x, to.y - from.y)
+        }
+        let total = lengths.reduce(0, +)
+
+        var timed: [(point: CGPoint, offset: TimeInterval)] = [(waypoints[0], 0)]
+        var travelled: CGFloat = 0
+        for (index, length) in lengths.enumerated() {
+            travelled += length
+            // A finger holding still has no distance to spread time along.
+            let fraction = total > 0
+                ? Double(travelled / total)
+                : Double(index + 1) / Double(lengths.count)
+            let offset = travel * fraction
+            let previous = timed[timed.count - 1]
+            let isLast = index == lengths.count - 1
+            if offset - previous.offset < PointerPath.minimumWaypointSpacing {
+                // Keep the destination; drop whichever waypoint crowds it.
+                if isLast, timed.count > 1 {
+                    timed.removeLast()
+                } else if !isLast {
+                    continue
+                }
+            }
+            timed.append((waypoints[index + 1], offset))
+        }
+        return timed
+    }
+
+    func describe() -> String {
+        let route = waypoints
+            .map { "(\(Int($0.x)),\(Int($0.y)))" }
+            .joined(separator: " -> ")
+        return "\(route) over \(Int(duration * 1000))ms"
+    }
+}
 
 private struct PinchSpec {
     let start1: (x: Double, y: Double)
@@ -1194,7 +1376,11 @@ public class GptDriver {
         self.gptDriverSessionId = sessionId
         self.sessionURL = sessionURL
 
-        XCTContext.runActivity(named: "GPTDriver Live Session URL") { activity in
+        // The URL goes in the activity name on purpose. Activities reach the xcodebuild log through
+        // the test manager connection on every destination, whereas on a physical device the runner's
+        // stdout and stderr are discarded, so the print and os_log lines above never make it into the
+        // log of a CI run such as Firebase Test Lab.
+        XCTContext.runActivity(named: "GPTDriver Live Session URL: \(sessionURL)") { activity in
             if let url = URL(string: sessionURL) {
                 let tempDirectory = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
                 let fileName = "gptd-session-link.webloc"
@@ -1703,6 +1889,10 @@ public class GptDriver {
         }
         
         log(.info, "Stopping session", metadata: ["status": status])
+        if let sessionURL {
+            // Repeated at the end so it is next to the failure in a long log.
+            XCTContext.runActivity(named: "GPTDriver Session \(status): \(sessionURL)") { _ in }
+        }
         
         let requestUrl = gptDriverBaseUrl
             .appendingPathComponent("sessions")
