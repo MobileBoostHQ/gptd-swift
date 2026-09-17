@@ -4,6 +4,12 @@ import UIKit
 import os
 import ObjCExceptionCatcher
 
+/// Which SDK opened a session, reported as `metadata.language` on `POST /sessions/create`.
+/// Matches the spelling the other clients use ("Python", "TypeScript", "Android-Kotlin"), and is
+/// what reporting keys on to tell an iOS session apart from an Android one when the device
+/// configuration does not say - which, on the native XCUITest path, it does not.
+private let sdkLanguage = "Swift"
+
 // MARK: - Models for Appium/GPT Commands
 
 struct GPTCommand: Decodable {
@@ -762,6 +768,7 @@ public class GptDriver {
     private let additionalUserContext: String
     private let logNativeExecutions: Bool
     private let charactersPerSecond: Int?
+    private let metadata: [String: String]
     private var stepCounter: Int = 1
     
     /// Optional callback that is invoked when a new session is created.
@@ -813,7 +820,8 @@ public class GptDriver {
                   testId: String = "",
                   additionalUserContext: String = "",
                   logNativeExecutions: Bool = true,
-                  charactersPerSecond: Int? = 10) {
+                  charactersPerSecond: Int? = 10,
+                  metadata: [String: String] = [:]) {
         self.apiKey = apiKey
         self.appiumServerUrl = appiumServerUrl
         self.deviceName = deviceName
@@ -825,6 +833,7 @@ public class GptDriver {
         self.additionalUserContext = additionalUserContext
         self.logNativeExecutions = logNativeExecutions
         self.charactersPerSecond = charactersPerSecond
+        self.metadata = metadata
 
         if appiumServerUrl == nil {
             self.nativeApp = nativeApp ?? XCUIApplication()
@@ -847,14 +856,19 @@ public class GptDriver {
     ///     a time and pauses `1 / charactersPerSecond` seconds in between, so apps that do per-keystroke work have
     ///     time to keep up. Lower it if characters still go missing on slow or heavily loaded devices. Pass `nil` to
     ///     type each string in a single `typeText` call instead, which is faster but can drop characters.
+    ///   - metadata: Free-form key/values recorded on the session, e.g. `["branch": "master"]`. Nothing in the SDK
+    ///     or the backend interprets them; they exist so a run can be found again by something only your CI knows -
+    ///     which branch it built, which job started it, which shard it was - and so reporting can be sliced by them.
+    ///     `language` is reserved for the SDK's own identity and cannot be overridden here. Defaults to empty.
     public convenience init(apiKey: String,
                             nativeApp: XCUIApplication = XCUIApplication(),
                             cachingMode: CachingMode = .none,
                             testId: String = "",
                             additionalUserContext: String = "",
                             logNativeExecutions: Bool = true,
-                            charactersPerSecond: Int? = 10) {
-        self.init(apiKey: apiKey, appiumServerUrl: nil, deviceName: nil, platform: nil, platformVersion: nil, nativeApp: nativeApp, cachingMode: cachingMode, testId: testId, additionalUserContext: additionalUserContext, logNativeExecutions: logNativeExecutions, charactersPerSecond: charactersPerSecond)
+                            charactersPerSecond: Int? = 10,
+                            metadata: [String: String] = [:]) {
+        self.init(apiKey: apiKey, appiumServerUrl: nil, deviceName: nil, platform: nil, platformVersion: nil, nativeApp: nativeApp, cachingMode: cachingMode, testId: testId, additionalUserContext: additionalUserContext, logNativeExecutions: logNativeExecutions, charactersPerSecond: charactersPerSecond, metadata: metadata)
     }
     
     /// Initializes GptDriver for execution via a remote Appium server.
@@ -874,6 +888,10 @@ public class GptDriver {
     ///     a time and pauses `1 / charactersPerSecond` seconds in between, so apps that do per-keystroke work have
     ///     time to keep up. Lower it if characters still go missing on slow or heavily loaded devices. Pass `nil` to
     ///     type each string in a single `typeText` call instead, which is faster but can drop characters.
+    ///   - metadata: Free-form key/values recorded on the session, e.g. `["branch": "master"]`. Nothing in the SDK
+    ///     or the backend interprets them; they exist so a run can be found again by something only your CI knows -
+    ///     which branch it built, which job started it, which shard it was - and so reporting can be sliced by them.
+    ///     `language` is reserved for the SDK's own identity and cannot be overridden here. Defaults to empty.
     public convenience init(apiKey: String,
                             appiumServerUrl: URL,
                             deviceName: String,
@@ -883,8 +901,9 @@ public class GptDriver {
                             testId: String = "",
                             additionalUserContext: String = "",
                             logNativeExecutions: Bool = true,
-                            charactersPerSecond: Int? = 10) {
-        self.init(apiKey: apiKey, appiumServerUrl: appiumServerUrl, deviceName: deviceName, platform: platform, platformVersion: platformVersion, nativeApp: nil, cachingMode: cachingMode, testId: testId, additionalUserContext: additionalUserContext, logNativeExecutions: logNativeExecutions, charactersPerSecond: charactersPerSecond)
+                            charactersPerSecond: Int? = 10,
+                            metadata: [String: String] = [:]) {
+        self.init(apiKey: apiKey, appiumServerUrl: appiumServerUrl, deviceName: deviceName, platform: platform, platformVersion: platformVersion, nativeApp: nil, cachingMode: cachingMode, testId: testId, additionalUserContext: additionalUserContext, logNativeExecutions: logNativeExecutions, charactersPerSecond: charactersPerSecond, metadata: metadata)
     }
     
     deinit {
@@ -1359,7 +1378,18 @@ public class GptDriver {
             "build_id": "",
             "test_id": testId,
             "caching_mode": cachingMode.rawValue,
-            "additional_user_context": additionalUserContext
+            "additional_user_context": additionalUserContext,
+            // One `metadata` field on the wire, two things to say through it: which SDK opened
+            // the session, and whatever the caller's harness knows about the run (the branch it
+            // built, the CI job that started it). Shallow-merged with SDK identity winning, so a
+            // caller passing `language` cannot misreport which SDK this is.
+            //
+            // `version` is deliberately absent, unlike every other SDK. The others read it from
+            // package metadata at runtime (importlib.metadata, package.json, BuildConfig); a
+            // Swift package has no equivalent, so the only way to report one here would be a
+            // constant somebody has to remember to bump - which is how a version field starts
+            // lying. Absent beats wrong.
+            "metadata": metadata.merging(["language": sdkLanguage], uniquingKeysWith: { _, identity in identity })
         ]
         
         let responseData = try await postJson(to: url, jsonObject: body)
