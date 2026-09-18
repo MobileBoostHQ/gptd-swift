@@ -10,6 +10,19 @@ import ObjCExceptionCatcher
 /// configuration does not say - which, on the native XCUITest path, it does not.
 private let sdkLanguage = "Swift"
 
+/// Which build of this package opened the session, reported as `metadata.version`. The dashboard
+/// prints it next to the language, so it is the only way to tell which SDK a customer is running
+/// when their sessions start behaving differently.
+///
+/// BUMP THIS IN THE RELEASE COMMIT, together with the tag. The other clients read their version
+/// from package metadata at runtime (importlib.metadata, package.json, BuildConfig); a Swift
+/// package has no runtime equivalent, so this constant is the only source, and a constant that
+/// drifts from the tag reports a version nobody shipped.
+private let sdkVersion = "1.12.0"
+
+/// The SDK's own identity, merged over caller metadata so neither key can be misreported.
+private let sdkIdentity = ["language": sdkLanguage, "version": sdkVersion]
+
 // MARK: - Models for Appium/GPT Commands
 
 struct GPTCommand: Decodable {
@@ -859,7 +872,8 @@ public class GptDriver {
     ///   - metadata: Free-form key/values recorded on the session, e.g. `["branch": "master"]`. Nothing in the SDK
     ///     or the backend interprets them; they exist so a run can be found again by something only your CI knows -
     ///     which branch it built, which job started it, which shard it was - and so reporting can be sliced by them.
-    ///     `language` is reserved for the SDK's own identity and cannot be overridden here. Defaults to empty.
+    ///     `language` and `version` are reserved for the SDK's own identity and cannot be overridden here.
+    ///     Defaults to empty.
     public convenience init(apiKey: String,
                             nativeApp: XCUIApplication = XCUIApplication(),
                             cachingMode: CachingMode = .none,
@@ -891,7 +905,8 @@ public class GptDriver {
     ///   - metadata: Free-form key/values recorded on the session, e.g. `["branch": "master"]`. Nothing in the SDK
     ///     or the backend interprets them; they exist so a run can be found again by something only your CI knows -
     ///     which branch it built, which job started it, which shard it was - and so reporting can be sliced by them.
-    ///     `language` is reserved for the SDK's own identity and cannot be overridden here. Defaults to empty.
+    ///     `language` and `version` are reserved for the SDK's own identity and cannot be overridden here.
+    ///     Defaults to empty.
     public convenience init(apiKey: String,
                             appiumServerUrl: URL,
                             deviceName: String,
@@ -1381,15 +1396,10 @@ public class GptDriver {
             "additional_user_context": additionalUserContext,
             // One `metadata` field on the wire, two things to say through it: which SDK opened
             // the session, and whatever the caller's harness knows about the run (the branch it
-            // built, the CI job that started it). Shallow-merged with SDK identity winning, so a
-            // caller passing `language` cannot misreport which SDK this is.
-            //
-            // `version` is deliberately absent, unlike every other SDK. The others read it from
-            // package metadata at runtime (importlib.metadata, package.json, BuildConfig); a
-            // Swift package has no equivalent, so the only way to report one here would be a
-            // constant somebody has to remember to bump - which is how a version field starts
-            // lying. Absent beats wrong.
-            "metadata": metadata.merging(["language": sdkLanguage], uniquingKeysWith: { _, identity in identity })
+            // built, the CI job that started it). Shallow-merged with SDK identity LAST, so a
+            // caller passing `language` or `version` cannot misreport the package - the dashboard
+            // prints both of those as this session's SDK.
+            "metadata": metadata.merging(sdkIdentity, uniquingKeysWith: { _, identity in identity })
         ]
         
         let responseData = try await postJson(to: url, jsonObject: body)

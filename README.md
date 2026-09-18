@@ -215,7 +215,7 @@ let gptDriver = GptDriver(
 )
 ```
 
-Nothing in the SDK or the backend interprets these. They are stored on the session so a run can be found again, and so reporting can be sliced by them - failure rates on `master` only, say. Keys are free-form, values are strings; `language` is reserved for the SDK's own identity.
+Nothing in the SDK or the backend interprets these. They are stored on the session so a run can be found again, and so reporting can be sliced by them - failure rates on `master` only, say. Keys are free-form, values are strings; `language` and `version` are reserved for the SDK's own identity and cannot be overridden.
 
 ## License
 
