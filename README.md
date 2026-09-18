@@ -200,6 +200,23 @@ let gptDriver = GptDriver(
 
 Available modes are `.none` (default), `.interactionRegion`, and `.fullScreen`. `execute` accepts a `cachingMode` argument to override the mode for a single step. Setting `testId` improves cache matching across runs of the same test.
 
+### Session metadata
+
+Pass `metadata` to record your own key/values on the session - anything your CI knows and the SDK does not:
+
+```swift
+let gptDriver = GptDriver(
+    apiKey: "YOUR_API_KEY",
+    nativeApp: app,
+    metadata: [
+        "branch": ProcessInfo.processInfo.environment["BUILDKITE_BRANCH"] ?? "unknown",
+        "job": ProcessInfo.processInfo.environment["BUILDKITE_JOB_ID"] ?? "unknown"
+    ]
+)
+```
+
+Nothing in the SDK or the backend interprets these. They are stored on the session so a run can be found again, and so reporting can be sliced by them - failure rates on `master` only, say. Keys are free-form, values are strings; `language` and `version` are reserved for the SDK's own identity and cannot be overridden.
+
 ## License
 
 This project is licensed under the Business Source License. See the LICENSE file for details.
