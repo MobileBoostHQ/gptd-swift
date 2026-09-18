@@ -18,7 +18,7 @@ private let sdkLanguage = "Swift"
 /// from package metadata at runtime (importlib.metadata, package.json, BuildConfig); a Swift
 /// package has no runtime equivalent, so this constant is the only source, and a constant that
 /// drifts from the tag reports a version nobody shipped.
-private let sdkVersion = "1.12.0"
+private let sdkVersion = "1.13.0"
 
 /// The SDK's own identity, merged over caller metadata so neither key can be misreported.
 private let sdkIdentity = ["language": sdkLanguage, "version": sdkVersion]
@@ -99,11 +99,45 @@ struct AnyDecodable: Decodable {
     }
 }
 
-enum GPTDriverError: Error {
+public enum GPTDriverError: Error {
     case executionFailed(String)
+    /// A response the SDK could not read: a 2xx whose body was not the shape
+    /// this call expected, or a reply that was not HTTP at all.
     case invalidResponse
     case missingSessionId
     case creationFailed(String)
+    /// The API refused the request, carrying what the server actually said.
+    /// The status code and its detail are the only things that tell a caller
+    /// whether to wait for capacity, fix an API key or talk to support, so
+    /// they travel with the error rather than being collapsed into
+    /// `invalidResponse` - which is what once made a 429 from the parallel
+    /// session cap read as an unexplained SDK failure in a CI log.
+    case httpError(statusCode: Int, path: String, detail: String)
+}
+
+extension GPTDriverError: CustomStringConvertible {
+    /// Spelled out here because this is what a test harness prints. Wrapping
+    /// the error in a struct or another enum's associated value and
+    /// interpolating that, which is the usual shape of a CI failure message,
+    /// reaches `CustomStringConvertible` and nothing else.
+    public var description: String {
+        switch self {
+        case .executionFailed(let message):
+            return "GPT Driver execution failed: \(message)"
+        case .invalidResponse:
+            return "GPT Driver returned a response the SDK could not read"
+        case .missingSessionId:
+            return "GPT Driver has no active session"
+        case .creationFailed(let message):
+            return "GPT Driver session creation failed: \(message)"
+        case .httpError(let statusCode, let path, let detail):
+            return "GPT Driver API returned HTTP \(statusCode) for \(path): \(detail)"
+        }
+    }
+}
+
+extension GPTDriverError: LocalizedError {
+    public var errorDescription: String? { description }
 }
 
 /// Caching mode for GPT Driver interactions
@@ -1503,6 +1537,8 @@ public class GptDriver {
     
     private func performRequestWithRetry(request: URLRequest, maxRetries: Int = 3) async throws -> Data {
         var lastError: Error?
+        let path = request.url?.path ?? request.url?.absoluteString ?? "unknown"
+        var retryBudget = Self.maxTotalRetryDelay
         
         for attempt in 0..<maxRetries {
             do {
@@ -1519,18 +1555,35 @@ public class GptDriver {
                     return data
                 }
                 
-                if shouldRetry(statusCode: httpResponse.statusCode) && attempt < maxRetries - 1 {
-                    let delay = exponentialBackoff(attempt: attempt)
+                let retryAfter = Self.retryAfterSeconds(
+                    from: httpResponse.value(forHTTPHeaderField: "Retry-After"))
+                
+                if shouldRetry(statusCode: httpResponse.statusCode), attempt < maxRetries - 1,
+                   let delay = Self.retryDelay(attempt: attempt,
+                                               retryAfter: retryAfter,
+                                               budgetRemaining: retryBudget) {
+                    retryBudget -= delay
                     log(.info, "Request failed with retryable status", metadata: [
                         "statusCode": httpResponse.statusCode,
+                        "path": path,
                         "retryDelay": delay,
+                        "retryAfterHonoured": retryAfter != nil,
                         "attempt": attempt + 1
                     ])
                     try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
                     continue
                 }
                 
-                throw GPTDriverError.invalidResponse
+                let detail = Self.describeResponseBody(data)
+                log(.error, "Request refused by the API", metadata: [
+                    "statusCode": httpResponse.statusCode,
+                    "path": path,
+                    "detail": detail,
+                    "attempts": attempt + 1
+                ])
+                throw GPTDriverError.httpError(statusCode: httpResponse.statusCode,
+                                               path: path,
+                                               detail: detail)
             } catch let error as URLError {
                 lastError = error
                 log(.error, "Network error", metadata: [
@@ -1539,8 +1592,11 @@ public class GptDriver {
                     "attempt": attempt + 1
                 ])
                 
-                if shouldRetryURLError(error) && attempt < maxRetries - 1 {
-                    let delay = exponentialBackoff(attempt: attempt)
+                if shouldRetryURLError(error), attempt < maxRetries - 1,
+                   let delay = Self.retryDelay(attempt: attempt,
+                                               retryAfter: nil,
+                                               budgetRemaining: retryBudget) {
+                    retryBudget -= delay
                     log(.info, "Retrying after network error", metadata: [
                         "retryDelay": delay,
                         "description": error.localizedDescription,
@@ -1579,8 +1635,90 @@ public class GptDriver {
         }
     }
     
-    private func exponentialBackoff(attempt: Int) -> Double {
+    private static func exponentialBackoff(attempt: Int) -> Double {
         return min(pow(2.0, Double(attempt)) * 2.0, 16.0)
+    }
+    
+    /// The longest single wait the SDK will take from a `Retry-After`.
+    private static let maxRetryAfterDelay: TimeInterval = 60
+    
+    /// The longest one request may spend waiting across all of its attempts.
+    /// The parallel session cap asks for 60s and there are three attempts, so
+    /// without a ceiling a single call could sit in backoff for three minutes
+    /// while the caller's own timeout - 60s on `assert`, 15s on
+    /// `setSessionFailed` - fired long before and left it sleeping.
+    private static let maxTotalRetryDelay: TimeInterval = 90
+    
+    private static let maxErrorDetailLength = 500
+    
+    private static let httpDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "GMT")
+        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+        return formatter
+    }()
+    
+    /// How long the server asked us to wait, in either form RFC 9110 allows:
+    /// delta-seconds, or an HTTP-date. `nil` when the header is absent or is
+    /// neither of those.
+    static func retryAfterSeconds(from headerValue: String?, now: Date = Date()) -> TimeInterval? {
+        guard let raw = headerValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty else {
+            return nil
+        }
+        
+        if let seconds = TimeInterval(raw) {
+            return seconds.isFinite ? max(0, seconds) : nil
+        }
+        
+        if let date = httpDateFormatter.date(from: raw) {
+            return max(0, date.timeIntervalSince(now))
+        }
+        
+        return nil
+    }
+    
+    /// How long to wait before the next attempt, or `nil` to stop retrying.
+    ///
+    /// A server that sends `Retry-After` knows something the backoff curve
+    /// does not. Capacity refusals here free up on a fixed window - the
+    /// parallel session cap counts sessions seen in the last 60 seconds - so
+    /// retrying after 2s and then 4s spends every attempt inside the window
+    /// that is already full and fails a test that waiting would have passed.
+    static func retryDelay(attempt: Int,
+                           retryAfter: TimeInterval?,
+                           budgetRemaining: TimeInterval) -> TimeInterval? {
+        guard budgetRemaining > 0 else { return nil }
+        let requested = retryAfter.map { min($0, maxRetryAfterDelay) }
+            ?? exponentialBackoff(attempt: attempt)
+        return min(requested, budgetRemaining)
+    }
+    
+    /// What the server said, for the error the caller sees. FastAPI puts the
+    /// message in `detail`; anything else is passed through as text, truncated
+    /// because a refusal body is occasionally an HTML page from a proxy rather
+    /// than one of ours.
+    static func describeResponseBody(_ data: Data) -> String {
+        guard !data.isEmpty else { return "<empty response body>" }
+        
+        if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let detail = json["detail"] {
+            if let text = detail as? String {
+                return truncateForError(text)
+            }
+            return truncateForError(String(describing: detail))
+        }
+        
+        guard let text = String(data: data, encoding: .utf8) else {
+            return "<\(data.count) bytes of non-text response body>"
+        }
+        return truncateForError(text.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+    
+    private static func truncateForError(_ text: String) -> String {
+        guard text.count > maxErrorDetailLength else { return text }
+        return String(text.prefix(maxErrorDetailLength)) + "... (truncated)"
     }
     
     private func getJson(from url: URL) async throws -> [String: Any] {

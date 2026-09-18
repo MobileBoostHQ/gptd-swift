@@ -148,6 +148,42 @@ let itemCost = costs["cost of item"]
 
 `assert` and `assertBulk` fail the test when a condition is not met. `checkBulk` returns the results instead so you can branch on them.
 
+### When the API refuses a call
+
+Every SDK method throws `GPTDriverError`. When the API refuses a request, the error is `.httpError` and carries the status code, the endpoint and the server's own message, so a CI log says what went wrong:
+
+```
+GPT Driver API returned HTTP 429 for /sessions/create: Maximum number of parallel sessions (16) reached for this organisation. Sessions free up as running tests finish.
+```
+
+Branch on it if a particular refusal needs its own handling:
+
+```swift
+do {
+    try gptDriver.execute("Tap Checkout")
+} catch GPTDriverError.httpError(let statusCode, _, let detail) where statusCode == 429 {
+    throw XCTSkip("No GPT Driver capacity right now: \(detail)")
+}
+```
+
+The ones worth knowing:
+
+| Status | What it means | Retried by the SDK |
+|---|---|---|
+| `429` | Your organisation is at its parallel session cap | yes |
+| `503` | The API is shedding load | yes |
+| `5xx`, `408` | Transient server or gateway failure | yes |
+| `401` | The API key is not valid | no |
+| `402` | The organisation is past its booked AI volume | no |
+
+`.invalidResponse` now means only what its name says: the call succeeded but the body was not the shape the SDK expected.
+
+#### Retries
+
+Retryable failures are attempted three times. When the response carries a `Retry-After`, the SDK waits for as long as it asks rather than using its own backoff, in either form the standard allows (a number of seconds, or an HTTP date). That matters for `429`: capacity frees up on a fixed window, so retrying sooner than the server suggests just spends the attempts inside a window that is already full.
+
+A single wait is capped at 60 seconds and one request will not spend more than 90 seconds in total waiting, so a long `Retry-After` cannot outlast the `timeout` you passed to the calling method. Without a `Retry-After`, the SDK falls back to exponential backoff starting at 2 seconds.
+
 ### Session status
 
 ```swift
