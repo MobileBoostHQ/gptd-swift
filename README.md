@@ -236,6 +236,18 @@ let gptDriver = GptDriver(
 
 Available modes are `.none` (default), `.interactionRegion`, and `.fullScreen`. `execute` accepts a `cachingMode` argument to override the mode for a single step. Setting `testId` improves cache matching across runs of the same test.
 
+Each successful (or auto-completed) session becomes the baseline that later runs of the same test replay. To run a session that uses the cache but never replaces that baseline, for example an experimental variant of a test, pass `excludeFromBaseline: true`:
+
+```swift
+let gptDriver = GptDriver(
+    apiKey: "YOUR_API_KEY",
+    nativeApp: app,
+    cachingMode: .interactionRegion,
+    testId: "add-to-cart-haul-away",
+    excludeFromBaseline: true
+)
+```
+
 ### Session metadata
 
 Pass `metadata` to record your own key/values on the session - anything your CI knows and the SDK does not:

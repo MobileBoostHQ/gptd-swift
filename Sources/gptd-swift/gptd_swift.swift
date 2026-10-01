@@ -18,7 +18,7 @@ private let sdkLanguage = "Swift"
 /// from package metadata at runtime (importlib.metadata, package.json, BuildConfig); a Swift
 /// package has no runtime equivalent, so this constant is the only source, and a constant that
 /// drifts from the tag reports a version nobody shipped.
-private let sdkVersion = "1.13.0"
+private let sdkVersion = "1.14.0"
 
 /// The SDK's own identity, merged over caller metadata so neither key can be misreported.
 private let sdkIdentity = ["language": sdkLanguage, "version": sdkVersion]
@@ -816,6 +816,7 @@ public class GptDriver {
     private let logNativeExecutions: Bool
     private let charactersPerSecond: Int?
     private let metadata: [String: String]
+    private let excludeFromBaseline: Bool
     private var stepCounter: Int = 1
     
     /// Optional callback that is invoked when a new session is created.
@@ -868,7 +869,8 @@ public class GptDriver {
                   additionalUserContext: String = "",
                   logNativeExecutions: Bool = true,
                   charactersPerSecond: Int? = 10,
-                  metadata: [String: String] = [:]) {
+                  metadata: [String: String] = [:],
+                  excludeFromBaseline: Bool = false) {
         self.apiKey = apiKey
         self.appiumServerUrl = appiumServerUrl
         self.deviceName = deviceName
@@ -881,6 +883,7 @@ public class GptDriver {
         self.logNativeExecutions = logNativeExecutions
         self.charactersPerSecond = charactersPerSecond
         self.metadata = metadata
+        self.excludeFromBaseline = excludeFromBaseline
 
         if appiumServerUrl == nil {
             self.nativeApp = nativeApp ?? XCUIApplication()
@@ -908,6 +911,10 @@ public class GptDriver {
     ///     which branch it built, which job started it, which shard it was - and so reporting can be sliced by them.
     ///     `language` and `version` are reserved for the SDK's own identity and cannot be overridden here.
     ///     Defaults to empty.
+    ///   - excludeFromBaseline: When `true`, this session never becomes the caching baseline that later runs
+    ///     replay, whatever status it ends in. It still replays an existing baseline when `cachingMode` is set.
+    ///     Use it for exploratory or experimental runs of a test that should not replace its recorded steps.
+    ///     Defaults to `false`.
     public convenience init(apiKey: String,
                             nativeApp: XCUIApplication = XCUIApplication(),
                             cachingMode: CachingMode = .none,
@@ -915,8 +922,9 @@ public class GptDriver {
                             additionalUserContext: String = "",
                             logNativeExecutions: Bool = true,
                             charactersPerSecond: Int? = 10,
-                            metadata: [String: String] = [:]) {
-        self.init(apiKey: apiKey, appiumServerUrl: nil, deviceName: nil, platform: nil, platformVersion: nil, nativeApp: nativeApp, cachingMode: cachingMode, testId: testId, additionalUserContext: additionalUserContext, logNativeExecutions: logNativeExecutions, charactersPerSecond: charactersPerSecond, metadata: metadata)
+                            metadata: [String: String] = [:],
+                            excludeFromBaseline: Bool = false) {
+        self.init(apiKey: apiKey, appiumServerUrl: nil, deviceName: nil, platform: nil, platformVersion: nil, nativeApp: nativeApp, cachingMode: cachingMode, testId: testId, additionalUserContext: additionalUserContext, logNativeExecutions: logNativeExecutions, charactersPerSecond: charactersPerSecond, metadata: metadata, excludeFromBaseline: excludeFromBaseline)
     }
     
     /// Initializes GptDriver for execution via a remote Appium server.
@@ -941,6 +949,10 @@ public class GptDriver {
     ///     which branch it built, which job started it, which shard it was - and so reporting can be sliced by them.
     ///     `language` and `version` are reserved for the SDK's own identity and cannot be overridden here.
     ///     Defaults to empty.
+    ///   - excludeFromBaseline: When `true`, this session never becomes the caching baseline that later runs
+    ///     replay, whatever status it ends in. It still replays an existing baseline when `cachingMode` is set.
+    ///     Use it for exploratory or experimental runs of a test that should not replace its recorded steps.
+    ///     Defaults to `false`.
     public convenience init(apiKey: String,
                             appiumServerUrl: URL,
                             deviceName: String,
@@ -951,8 +963,9 @@ public class GptDriver {
                             additionalUserContext: String = "",
                             logNativeExecutions: Bool = true,
                             charactersPerSecond: Int? = 10,
-                            metadata: [String: String] = [:]) {
-        self.init(apiKey: apiKey, appiumServerUrl: appiumServerUrl, deviceName: deviceName, platform: platform, platformVersion: platformVersion, nativeApp: nil, cachingMode: cachingMode, testId: testId, additionalUserContext: additionalUserContext, logNativeExecutions: logNativeExecutions, charactersPerSecond: charactersPerSecond, metadata: metadata)
+                            metadata: [String: String] = [:],
+                            excludeFromBaseline: Bool = false) {
+        self.init(apiKey: apiKey, appiumServerUrl: appiumServerUrl, deviceName: deviceName, platform: platform, platformVersion: platformVersion, nativeApp: nil, cachingMode: cachingMode, testId: testId, additionalUserContext: additionalUserContext, logNativeExecutions: logNativeExecutions, charactersPerSecond: charactersPerSecond, metadata: metadata, excludeFromBaseline: excludeFromBaseline)
     }
     
     deinit {
@@ -1428,6 +1441,7 @@ public class GptDriver {
             "test_id": testId,
             "caching_mode": cachingMode.rawValue,
             "additional_user_context": additionalUserContext,
+            "exclude_from_baseline": excludeFromBaseline,
             // One `metadata` field on the wire, two things to say through it: which SDK opened
             // the session, and whatever the caller's harness knows about the run (the branch it
             // built, the CI job that started it). Shallow-merged with SDK identity LAST, so a
