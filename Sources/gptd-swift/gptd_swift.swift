@@ -491,15 +491,29 @@ class NativeActionExecutor {
                 }
                 
                 let coordinate = self.coordinateFor(x: x, y: y)
-                log(.info, "Pointer press", metadata: [
-                    "x": x,
-                    "y": y,
-                    "duration": pressDuration,
-                    "cacheHit": cacheHit
-                ])
-                XCTContext.runActivity(named: "GPTDriver Press for \(pressDuration)s at \(x), \(y)\(cacheLabel)") { _ in }
-                coordinate.press(forDuration: pressDuration)
-                
+                if let alertButton = self.systemAlertButton(at: coordinate.screenPoint) {
+                    // An alert button fires on release whatever the hold, so a tap stands in for the press.
+                    let buttonLabel = alertButton.label
+                    log(.info, "Pointer press on a system alert button; tapping the button", metadata: [
+                        "x": x,
+                        "y": y,
+                        "duration": pressDuration,
+                        "button": buttonLabel,
+                        "cacheHit": cacheHit
+                    ])
+                    XCTContext.runActivity(named: "GPTDriver Tap system alert button '\(buttonLabel)' at \(x), \(y)\(cacheLabel)") { _ in }
+                    alertButton.tap()
+                } else {
+                    log(.info, "Pointer press", metadata: [
+                        "x": x,
+                        "y": y,
+                        "duration": pressDuration,
+                        "cacheHit": cacheHit
+                    ])
+                    XCTContext.runActivity(named: "GPTDriver Press for \(pressDuration)s at \(x), \(y)\(cacheLabel)") { _ in }
+                    coordinate.press(forDuration: pressDuration)
+                }
+
             } else if actions.count == 5,
                       let first = actions.first,
                       first.type == "pointerMove",
@@ -654,6 +668,38 @@ class NativeActionExecutor {
         
         let base = app.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0))
         return base.withOffset(CGVector(dx: pointX, dy: pointY))
+    }
+
+    // MARK: - System alerts
+
+    /// Hosts the system permission alerts (notifications, location, tracking).
+    private static let springboardBundleIdentifier = "com.apple.springboard"
+
+    /// The button of a system alert under `point`, or nil if no system alert is up or the point
+    /// misses its buttons, in which case the caller taps the coordinate as before.
+    ///
+    /// A coordinate tap is made on behalf of the app under test, so while a springboard alert is up
+    /// it reaches the app element underneath instead of the alert: 'Allow' on the notifications
+    /// prompt opened 'Scan to ride' (MB-923). Tapping the button through springboard's own element
+    /// reaches the alert. In-app alerts (UIAlertController) live in the app's own tree, so a
+    /// coordinate tap already lands on them, and they are not queried here: that would cost a
+    /// snapshot of the whole app on every tap.
+    ///
+    /// `point` is in screen points, the space `XCUICoordinate.screenPoint` and `XCUIElement.frame`
+    /// share. `exists` takes one snapshot and does not wait, so a tap with no alert up pays a
+    /// single query of springboard's small tree.
+    @MainActor
+    private func systemAlertButton(at point: CGPoint) -> XCUIElement? {
+        let springboard = XCUIApplication(bundleIdentifier: Self.springboardBundleIdentifier)
+        let alerts = springboard.alerts
+        guard alerts.firstMatch.exists else { return nil }
+
+        for alert in alerts.allElementsBoundByIndex where alert.exists && alert.frame.contains(point) {
+            for button in alert.buttons.allElementsBoundByIndex where button.exists && button.frame.contains(point) {
+                return button
+            }
+        }
+        return nil
     }
 }
 
@@ -1965,7 +2011,7 @@ public class GptDriver {
                     "api_key": apiKey,
                     "base64_screenshot": screenshotBase64,
                     "assertions": conditions,
-                    "command": "Assert: \(String(describing: try? JSONSerialization.data(withJSONObject: conditions, options: [])))",
+                    "command": assertionCommandLabel(conditions),
                     "step_counter": currentStep,
                     "caching_mode": cachingMode.rawValue
                 ]
