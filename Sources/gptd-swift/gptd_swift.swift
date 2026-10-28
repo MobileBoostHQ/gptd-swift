@@ -491,7 +491,8 @@ class NativeActionExecutor {
                 }
                 
                 let coordinate = self.coordinateFor(x: x, y: y)
-                if let alertButton = self.systemAlertButton(at: coordinate.screenPoint) {
+                let scale = Double(UIScreen.main.scale)
+                if let alertButton = self.systemAlertButton(at: CGPoint(x: x / scale, y: y / scale)) {
                     // An alert button fires on release whatever the hold, so a tap stands in for the press.
                     let buttonLabel = alertButton.label
                     log(.info, "Pointer press on a system alert button; tapping the button", metadata: [
@@ -678,16 +679,19 @@ class NativeActionExecutor {
     /// The button of a system alert under `point`, or nil if no system alert is up or the point
     /// misses its buttons, in which case the caller taps the coordinate as before.
     ///
-    /// A coordinate tap is made on behalf of the app under test, so while a springboard alert is up
-    /// it reaches the app element underneath instead of the alert: 'Allow' on the notifications
-    /// prompt opened 'Scan to ride' (MB-923). Tapping the button through springboard's own element
-    /// reaches the alert. In-app alerts (UIAlertController) live in the app's own tree, so a
-    /// coordinate tap already lands on them, and they are not queried here: that would cost a
-    /// snapshot of the whole app on every tap.
+    /// Before XCTest presses a coordinate of the app under test it checks for interrupting
+    /// elements. While a springboard alert is up, its default interruption handler dismisses the
+    /// alert with a button of its own choosing ('Allow' on the notifications prompt, 'Don't Allow'
+    /// on the location one), and the press then still reaches the app underneath: 'Allow' opened
+    /// 'Scan to ride' (MB-923). Tapping the button through springboard's own element is not an
+    /// interruption, so only the button the agent aimed at is tapped. In-app alerts
+    /// (UIAlertController) live in the app's own tree, so a coordinate tap already lands on them,
+    /// and they are not queried here: that would cost a snapshot of the whole app on every tap.
     ///
-    /// `point` is in screen points, the space `XCUICoordinate.screenPoint` and `XCUIElement.frame`
-    /// share. `exists` takes one snapshot and does not wait, so a tap with no alert up pays a
-    /// single query of springboard's small tree.
+    /// `point` is in the interface-oriented points `XCUIElement.frame` uses. That is not the space
+    /// of `XCUICoordinate.screenPoint`, which stays in portrait device orientation, so in landscape
+    /// the two differ. `exists` takes one snapshot and does not wait, so a tap with no alert up
+    /// pays a single query of springboard's small tree.
     @MainActor
     private func systemAlertButton(at point: CGPoint) -> XCUIElement? {
         let springboard = XCUIApplication(bundleIdentifier: Self.springboardBundleIdentifier)
